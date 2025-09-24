@@ -77,7 +77,7 @@ g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
 
 ## Personal Notes
 - Built on/for Ubuntu 24.04
-- It uses Sony's official Camera Remote SDK. You can search it or download it here: https://support.d-imaging.sony.co.jp/app/sdk/en/index.html
+- It uses Sony's official Camera Remote SDK (not included here).
 - I leaned heavily on ChatGPT while creating this, so please don't mind the mess! ;)
 
 ---
