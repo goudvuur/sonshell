@@ -1,4 +1,4 @@
-# Sony a6700 Remote Helper — Developer Guide
+# SonyShell — Developer Guide
 
 This document explains how the cleaned Linux-only helper works so you can extend it quickly. The code lives in **sony-a6700-remote-cleaned.cpp**.
 
