@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sony_connect_only LANGUAGES CXX)
+project(sonyshell LANGUAGES CXX)
 
 # Path to the extracted Sony SDK (folder that contains "app" and "external")
 set(SONY_SDK_DIR "" CACHE PATH "Path to the root of Sony Camera Remote SDK package")
@@ -14,44 +14,60 @@ set(CRSDK_ADAPTER   "${CRSDK_ROOT}/CrAdapter")
 # Headers live in the SDK’s "app" folder for this package layout
 include_directories(
   "${SONY_SDK_DIR}/app"
+  "${SONY_SDK_DIR}/external/opencv/include"
   "${CMAKE_BINARY_DIR}/gen"
 )
 
-add_executable(sony_connect_only
+add_executable(sonyshell
   src/main.cpp
 )
 
-# Ensure runtime loader finds libs next to the binary + the subfolders the SDK probes
-# ($ORIGIN is the dir of the built binary)
+# --- RPATH / RUNPATH configuration ------------------------------------------
+set(CMAKE_SKIP_BUILD_RPATH FALSE)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# Keep runtime search paths relative to the executable
 set(_rpaths
   "$ORIGIN"
   "$ORIGIN/CrAdapter"
-  "$ORIGIN/glibc-hwcaps/x86-64-v3"
-  "$ORIGIN/glibc-hwcaps/x86-64-v2"
-  "$ORIGIN/CrAdapter/glibc-hwcaps/x86-64-v3"
-  "$ORIGIN/CrAdapter/glibc-hwcaps/x86-64-v2"
 )
-string (REPLACE ";" ":" _rpath_str "${_rpaths}")
-set_target_properties(sony_connect_only PROPERTIES
+set_target_properties(sonyshell PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED YES
   CXX_EXTENSIONS NO
-  BUILD_RPATH   "${_rpath_str}"
-  INSTALL_RPATH "${_rpath_str}"
+  BUILD_RPATH   "${_rpaths}"
+  INSTALL_RPATH "${_rpaths}"
 )
 
-# Link against SDK core + IP adaptor
-target_link_libraries(sony_connect_only
+# Extra safety: also pass rpath flags directly to the linker
+target_link_options(sonyshell PRIVATE
+  "-Wl,-rpath,$ORIGIN"
+  "-Wl,-rpath,$ORIGIN/CrAdapter"
+)
+
+# --- Linking ----------------------------------------------------------------
+# Turn off --as-needed around OpenCV libs so they remain DT_NEEDED even if only transitively required
+target_link_libraries(sonyshell
   PRIVATE
     "${CRSDK_ROOT}/libCr_Core.so"
     "${CRSDK_ADAPTER}/libCr_PTP_IP.so"
+
+    -Wl,--no-as-needed
+    ${SONY_SDK_DIR}/external/opencv/Linux/libopencv_core.so.408
+    ${SONY_SDK_DIR}/external/opencv/Linux/libopencv_highgui.so.408
+    ${SONY_SDK_DIR}/external/opencv/Linux/libopencv_imgcodecs.so.408
+    ${SONY_SDK_DIR}/external/opencv/Linux/libopencv_imgproc.so.408
+    -Wl,--as-needed
+
     dl pthread
 )
 
-# Helper macro: copy dir if it exists
+# --- Post-build copy helpers -------------------------------------------------
 function(copy_dir_if_exists SRC DST)
   if(EXISTS "${SRC}")
-    add_custom_command(TARGET sony_connect_only POST_BUILD
+    add_custom_command(TARGET sonyshell POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${DST}"
       COMMAND ${CMAKE_COMMAND} -E copy_directory "${SRC}" "${DST}"
     )
@@ -60,10 +76,9 @@ function(copy_dir_if_exists SRC DST)
   endif()
 endfunction()
 
-# Helper macro: copy file if it exists
 function(copy_file_if_exists SRC DST_DIR)
   if(EXISTS "${SRC}")
-    add_custom_command(TARGET sony_connect_only POST_BUILD
+    add_custom_command(TARGET sonyshell POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SRC}" "${DST_DIR}"
     )
   else()
@@ -72,23 +87,17 @@ function(copy_file_if_exists SRC DST_DIR)
 endfunction()
 
 # Core + monitor protocol libs
-copy_file_if_exists("${CRSDK_ROOT}/libCr_Core.so"              "$<TARGET_FILE_DIR:sony_connect_only>")
-copy_file_if_exists("${CRSDK_ROOT}/libmonitor_protocol.so"     "$<TARGET_FILE_DIR:sony_connect_only>")
-copy_file_if_exists("${CRSDK_ROOT}/libmonitor_protocol_pf.so"  "$<TARGET_FILE_DIR:sony_connect_only>")
+copy_file_if_exists("${CRSDK_ROOT}/libCr_Core.so"              "$<TARGET_FILE_DIR:sonyshell>")
+copy_file_if_exists("${CRSDK_ROOT}/libmonitor_protocol.so"     "$<TARGET_FILE_DIR:sonyshell>")
+copy_file_if_exists("${CRSDK_ROOT}/libmonitor_protocol_pf.so"  "$<TARGET_FILE_DIR:sonyshell>")
 
 # Entire CrAdapter directory (brings libCr_PTP_IP.so, libssh2.so, libusb-1.0.so, etc.)
-copy_dir_if_exists("${CRSDK_ADAPTER}" "$<TARGET_FILE_DIR:sony_connect_only>/CrAdapter")
+copy_dir_if_exists("${CRSDK_ADAPTER}" "$<TARGET_FILE_DIR:sonyshell>/CrAdapter")
 
-# glibc-hwcaps trees the loader may probe (top-level and under CrAdapter)
-copy_dir_if_exists("${CRSDK_ROOT}/glibc-hwcaps/x86-64-v3" "$<TARGET_FILE_DIR:sony_connect_only>/glibc-hwcaps/x86-64-v3")
-copy_dir_if_exists("${CRSDK_ROOT}/glibc-hwcaps/x86-64-v2" "$<TARGET_FILE_DIR:sony_connect_only>/glibc-hwcaps/x86-64-v2")
-copy_dir_if_exists("${CRSDK_ADAPTER}/glibc-hwcaps/x86-64-v3" "$<TARGET_FILE_DIR:sony_connect_only>/CrAdapter/glibc-hwcaps/x86-64-v3")
-copy_dir_if_exists("${CRSDK_ADAPTER}/glibc-hwcaps/x86-64-v2" "$<TARGET_FILE_DIR:sony_connect_only>/CrAdapter/glibc-hwcaps/x86-64-v2")
-
-# (Optional) Copy OpenCV libs bundled with SDK (not strictly needed)
-copy_file_if_exists("${SONY_SDK_DIR}/external/opencv/Linux/libopencv_core.so.408"      "$<TARGET_FILE_DIR:sony_connect_only>")
-copy_file_if_exists("${SONY_SDK_DIR}/external/opencv/Linux/libopencv_highgui.so.408"   "$<TARGET_FILE_DIR:sony_connect_only>")
-copy_file_if_exists("${SONY_SDK_DIR}/external/opencv/Linux/libopencv_imgcodecs.so.408" "$<TARGET_FILE_DIR:sony_connect_only>")
-copy_file_if_exists("${SONY_SDK_DIR}/external/opencv/Linux/libopencv_imgproc.so.408"   "$<TARGET_FILE_DIR:sony_connect_only>")
+# Copy all OpenCV libs (and potential 3rd-party deps) next to the binary
+file(GLOB OPENCV_ALL_SO "${SONY_SDK_DIR}/external/opencv/Linux/*.so*")
+foreach(OPCV_SO ${OPENCV_ALL_SO})
+  copy_file_if_exists("${OPCV_SO}" "$<TARGET_FILE_DIR:sonyshell>")
+endforeach()
 
 message(STATUS "Configured with SONY_SDK_DIR=${SONY_SDK_DIR}")
