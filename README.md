@@ -71,7 +71,7 @@ g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
 - Download workers use threads + condition variables to sync progress.
 - Logging is plain `std::cout`/`std::cerr` with `std::endl` flushing.
 - Minimal globals, coordinated by atomics for stop/reconnect flags.
-- See [DOCS](./DOCS) for a deep dive into the internals.
+- See [DOCS.md](./DOCS.md) for a deep dive into the internals.
 
 ---
 
@@ -84,5 +84,5 @@ g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
 
 ## Links
 - Sony Camera Remote SDK: https://support.d-imaging.sony.co.jp/app/sdk/en/index.html
-- See `LICENSE` for licensing details.
+- See [LICENSE](./LICENSE) for licensing details.
 
