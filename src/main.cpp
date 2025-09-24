@@ -451,6 +451,26 @@ static bool try_connect_once(const std::string &explicit_ip,
     cb.device_handle = handle;
     std::cout << "Connected. Ctrl+C to stop." << std::endl;
 
+    // Start a background thread for interactive shutter trigger
+    std::thread shutterThread([&]() {
+        std::string line;
+        // Loop until program stop is requested
+        while (!g_stop.load(std::memory_order_relaxed)) {
+            // Wait for user to press Enter (std::getline blocks until a newline)
+            if (!std::getline(std::cin, line)) {
+                // If input stream closed or error, exit the thread loop
+                break;
+            }
+            // On any Enter key press (ignore content of input line), send shutter command
+            SDK::SendCommand(handle, SDK::CrCommandId_Release, SDK::CrCommandParam_Down);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            SDK::SendCommand(handle, SDK::CrCommandId_Release, SDK::CrCommandParam_Up);
+            std::cout << "Shutter triggered." << std::endl;
+        }
+    });
+    // Detach the thread so it runs independently
+    shutterThread.detach();
+
     // persist fingerprint
     {
         char newfp[512] = {0}; CrInt32u nlen = 0;

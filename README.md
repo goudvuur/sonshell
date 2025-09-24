@@ -1,4 +1,4 @@
-# SonyShell - an effort to "ssh into my Sony DSLR"
+# SonyShell - an effort to "ssh into my Sony camera"
 
 A Linux-only helper built on Sony’s official **Camera Remote SDK**.
 It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, downloads them automatically, and can optionally run a script on each downloaded file.
@@ -71,17 +71,9 @@ g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
 ---
 
 ## Developer Notes
-- Core behavior is driven by `QuietCallback` (an `IDeviceCallback` impl).
-- Download workers use threads + condition variables to sync progress.
-- Logging is plain `std::cout`/`std::cerr` with `std::endl` flushing.
-- Minimal globals, coordinated by atomics for stop/reconnect flags.
-- See [DOCS.md](./DOCS.md) for a deep dive into the internals.
-
----
-
-## Personal Notes
 - Built on/for Ubuntu 24.04
 - It uses Sony's official Camera Remote SDK (not included here).
+- See [DOCS.md](./DOCS.md) for a deep dive into the internals.
 - I leaned heavily on ChatGPT while creating this, so please don't mind the mess! ;)
 
 ---
