@@ -45,6 +45,10 @@ Direct IP connect, verbose logs, retry every 3s:
 ## Build
 Requires Linux, g++, and the Sony Camera Remote SDK.
 
+See [INSTALL.md](./INSTALL.md)
+
+or (untested)
+
 ```bash
 g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
     -I/path/to/CrSDK/include \
