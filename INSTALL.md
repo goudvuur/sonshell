@@ -1,6 +1,5 @@
 ```bash
-sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip
-libxml2-dev
+sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-dev libedit-dev
 
 SDK="$HOME/Projects/a6700/sdk/CrSDK_v2.00.00_20250805a_Linux64PC"
 

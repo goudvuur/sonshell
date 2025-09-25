@@ -18,9 +18,7 @@ include_directories(
   "${CMAKE_BINARY_DIR}/gen"
 )
 
-add_executable(sonshell
-  src/main.cpp
-)
+add_executable(sonshell src/main.cpp)
 
 # --- RPATH / RUNPATH configuration ------------------------------------------
 set(CMAKE_SKIP_BUILD_RPATH FALSE)
@@ -48,6 +46,10 @@ target_link_options(sonshell PRIVATE
 )
 
 # --- Linking ----------------------------------------------------------------
+
+find_library(EDIT_LIB edit REQUIRED)
+find_library(NCURSES_LIB ncurses REQUIRED)  # libedit depends on curses
+
 # Turn off --as-needed around OpenCV libs so they remain DT_NEEDED even if only transitively required
 target_link_libraries(sonshell
   PRIVATE
@@ -60,6 +62,9 @@ target_link_libraries(sonshell
     ${SONY_SDK_DIR}/external/opencv/Linux/libopencv_imgcodecs.so.408
     ${SONY_SDK_DIR}/external/opencv/Linux/libopencv_imgproc.so.408
     -Wl,--as-needed
+
+    ${EDIT_LIB}
+    ${NCURSES_LIB}
 
     dl pthread
 )
