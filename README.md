@@ -32,12 +32,12 @@ It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, 
 ### Examples
 Enumerate + keep retrying every 2s, run a hook after each file:
 ```bash
-./sonshell --dir /photos --keepalive 2000 --cmd /usr/local/bin/ingest-photo
+./sonshell --dir /tmp/photos --verbose --keepalive 3000 --cmd ../scripts/show_single.sh
 ```
 
 Direct IP connect, verbose logs, retry every 3s:
 ```bash
-./sonshell --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /photos -v --keepalive 3000
+./sonshell --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /tmp/photos -v --keepalive 3000
 ```
 
 ---
