@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <histedit.h>
 #include <functional>
+#include <deque>
 
 #include "CRSDK/CameraRemote_SDK.h"
 #include "CRSDK/ICrCameraObjectInfo.h"
@@ -50,6 +51,120 @@ static std::atomic<bool> g_reconnect{false};
 static std::string g_post_cmd; // optional executable/script to call after each photo
 static std::chrono::milliseconds g_keepalive{0};
 static std::thread inputThread;
+static int g_wake_pipe[2] = {-1, -1};
+static std::atomic<bool> g_repl_active{false};
+static std::atomic<bool> g_wake_pending{false};
+
+
+// ----------------------------
+// Logging
+// ----------------------------
+enum class LogLevel { Info, Warn, Error, Debug };
+
+struct LogItem {
+  LogLevel level;
+  std::string text;
+};
+
+static std::mutex        g_log_mtx;
+static std::condition_variable g_log_cv;
+static std::deque<LogItem> g_log_q;
+
+// Enqueue a message from any thread.
+static inline void log_enqueue(LogLevel lvl, std::string msg) {
+  if (!g_repl_active.load(std::memory_order_relaxed)) {
+    std::ostream& os = (lvl == LogLevel::Error) ? std::cerr : std::cout;
+    os << msg << std::endl;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_log_mtx);
+    g_log_q.push_back({lvl, std::move(msg)});
+  }
+  g_log_cv.notify_one();
+
+  // Write exactly one wake byte while a wake is pending
+  if (g_wake_pipe[1] != -1) {
+    bool expected = false;
+    if (g_wake_pending.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+      char x = 0;
+      (void)!write(g_wake_pipe[1], &x, 1);
+    }
+  }
+}
+
+// Stream-friendly macros: use like LOGI("foo " << x << " bar");
+#define LOGI(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Info,  _oss.str()); } while(0)
+#define LOGW(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Warn,  _oss.str()); } while(0)
+#define LOGE(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Error, _oss.str()); } while(0)
+#define LOGD(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Debug, _oss.str()); } while(0)
+
+// Drain everything that's queued and repaint the prompt.
+// Call ONLY from the input thread that owns `el`.
+static inline bool drain_logs_and_refresh(EditLine* el_or_null) {
+  std::deque<LogItem> local;
+  {
+    std::lock_guard<std::mutex> lk(g_log_mtx);
+    local.swap(g_log_q);
+  }
+
+  if (local.empty()) return false;
+
+  // clear current line once
+  std::fputs("\r\033[K", stdout);  // CR + clear-to-end-of-line
+
+  for (auto& it : local) {
+    std::ostream& os = (it.level == LogLevel::Error) ? std::cerr : std::cout;
+    os << it.text << '\n';
+  }
+  std::cout.flush();
+  std::cerr.flush();
+
+  if (el_or_null) el_set(el_or_null, EL_REFRESH, 0);
+  return true;
+}
+
+
+// Optional: blocking wait-with-timeout to reduce busy looping
+static inline void wait_for_logs_or_timeout(int ms) {
+  std::unique_lock<std::mutex> lk(g_log_mtx);
+  if (g_log_q.empty()) {
+    g_log_cv.wait_for(lk, std::chrono::milliseconds(ms));
+  }
+}
+
+// poll()-based getchar so logs can wake the REPL
+static int my_getc(EditLine*, char* c) {
+  struct pollfd fds[2];
+  int nfds = 1;
+  fds[0].fd = STDIN_FILENO;   fds[0].events = POLLIN; fds[0].revents = 0;
+  fds[1].fd = -1;             fds[1].events = POLLIN; fds[1].revents = 0;
+  if (g_wake_pipe[0] != -1) { fds[1].fd = g_wake_pipe[0]; nfds = 2; }
+
+  for (;;) {
+    int r = poll(fds, nfds, -1);
+    if (r < 0) {
+      if (errno == EINTR) continue;   // try again
+      return -1;                      // error
+    }
+
+    // Wake pipe: drain a chunk and signal "no char, try again"
+    if (nfds == 2 && (fds[1].revents & POLLIN)) {
+      char buf[256];
+      (void)read(g_wake_pipe[0], buf, sizeof(buf));
+      return -1;                      // wake (no char)
+    }
+
+    // Real input
+    if (fds[0].revents & POLLIN) {
+      ssize_t n = read(STDIN_FILENO, c, 1);
+      if (n == 1) return 1;           // <-- IMPORTANT: return COUNT = 1
+      if (n == 0)  return 0;          // EOF
+      if (errno == EINTR) continue;
+      return -1;                      // error
+    }
+  }
+}
 
 // ----------------------------
 // Signals
@@ -203,7 +318,7 @@ public:
 
   void OnConnected(SDK::DeviceConnectionVersioin v) override {
     if (g_shutting_down.load()) return;
-    if (verbose) std::cout << "[CB] OnConnected v=" << v << std::endl;
+    if (verbose) LOGI( "[CB] OnConnected v=" << v );
     {
       std::lock_guard<std::mutex> lk(mtx); connected = true; conn_finished = true;
     }
@@ -212,8 +327,7 @@ public:
 
   void OnDisconnected(CrInt32u error) override {
     if (g_shutting_down.load()) return;
-    std::cout << "[CB] OnDisconnected: 0x" << std::hex << error << std::dec
-	      << " (" << crsdk_err::error_to_name(error) << ")" << std::endl;
+    LOGI( "[CB] OnDisconnected: 0x" << std::hex << error << std::dec << " (" << crsdk_err::error_to_name(error) << ")" );
     {
       std::lock_guard<std::mutex> lk(mtx); last_error_code = error; conn_finished = true;
     }
@@ -228,15 +342,13 @@ public:
   void OnWarning(CrInt32u w) override {
     if (g_shutting_down.load()) return;
     if (verbose) {
-      std::cout << "[CB] OnWarning: " << crsdk_err::warning_to_name(w)
-		<< " (0x" << std::hex << w << std::dec << ")" << std::endl;
+      LOGI( "[CB] OnWarning: " << crsdk_err::warning_to_name(w) << " (0x" << std::hex << w << std::dec << ")" );
     }
   }
 
   void OnError(CrInt32u e) override {
     if (g_shutting_down.load()) return;
-    std::cout << "[CB] OnError: " << crsdk_err::error_to_name(e)
-	      << " (0x" << std::hex << e << std::dec << ")" << std::endl;
+    LOGI( "[CB] OnError: " << crsdk_err::error_to_name(e) << " (0x" << std::hex << e << std::dec << ")" );
     {
       std::lock_guard<std::mutex> lk(mtx); last_error_code = e; conn_finished = true;
     }
@@ -254,12 +366,11 @@ private:
       CrInt64u val = props[i].GetCurrentValue();
       auto it = last_prop_vals.find(code);
       if (it == last_prop_vals.end() || it->second != val) {
-	last_prop_vals[code] = val;
-	if (verbose) {
-	  const char *name = crsdk_util::prop_code_to_name(code);
-	  std::cout << tag << ": " << name << " (0x" << std::hex << code << std::dec
-		    << ") -> " << (long long)val << std::endl;
-	}
+    last_prop_vals[code] = val;
+    if (verbose) {
+      const char *name = crsdk_util::prop_code_to_name(code);
+      LOGI( tag << ": " << name << " (0x" << std::hex << code << std::dec << ") -> " << (long long)val );
+    }
       }
     }
     SDK::ReleaseDeviceProperties(device_handle, props);
@@ -271,113 +382,112 @@ public:
 
   void OnNotifyRemoteTransferContentsListChanged(CrInt32u notify, CrInt32u slotNumber, CrInt32u addSize) override {
     if (g_shutting_down.load()) return;
-    std::cout << "[CB] ContentsListChanged: notify=0x" << std::hex << notify << std::dec
-	      << " slot=" << slotNumber << " add=" << addSize << std::endl;
+    LOGI( "[CB] ContentsListChanged: notify=0x" << std::hex << notify << std::dec << " slot=" << slotNumber << " add=" << addSize );
     if (notify != SDK::CrNotify_RemoteTransfer_Changed_Add) return;
 
     try {
       g_downloadThreads.emplace_back([this, slotNumber, addSize]() {
-	SDK::CrDeviceHandle handle = this->device_handle;
-	if (!handle) return;
-	SDK::CrSlotNumber slot = (slotNumber == SDK::CrSlotNumber_Slot2) ? SDK::CrSlotNumber_Slot2 : SDK::CrSlotNumber_Slot1;
+    SDK::CrDeviceHandle handle = this->device_handle;
+    if (!handle) return;
+    SDK::CrSlotNumber slot = (slotNumber == SDK::CrSlotNumber_Slot2) ? SDK::CrSlotNumber_Slot2 : SDK::CrSlotNumber_Slot1;
 
-	// Robust fetch: date list -> latest day -> contents for that day
-	SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0; SDK::CrError resList = SDK::CrError_None;
-	const int max_attempts = 10;
-	for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-	  SDK::CrCaptureDate *dateList = nullptr; CrInt32u dateNums = 0;
-	  SDK::CrError derr = SDK::GetRemoteTransferCapturedDateList(handle, slot, &dateList, &dateNums);
-	  if (derr == SDK::CrError_None && dateList && dateNums > 0) {
-	    // pick latest by Y/M/D
-	    SDK::CrCaptureDate latest = dateList[0];
-	    for (CrInt32u i = 1; i < dateNums; ++i) {
-	      const auto &D = dateList[i];
-	      if ((D.year > latest.year) ||
-		  (D.year == latest.year && D.month > latest.month) ||
-		  (D.year == latest.year && D.month == latest.month && D.day > latest.day)) {
-		latest = D;
-	      }
-	    }
-	    resList = SDK::GetRemoteTransferContentsInfoList(handle, slot, SDK::CrGetContentsInfoListType_Range_Day, &latest, 0, &list, &count);
-	    SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    if (resList == SDK::CrError_None && list && count > 0) break;
-	    if (list) { SDK::ReleaseRemoteTransferContentsInfoList(handle, list); list = nullptr; count = 0; }
-	  } else {
-	    if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	  }
-	  std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
-	}
-	if (resList != SDK::CrError_None || !list || count == 0) {
-	  std::cerr << "[ERROR] Failed to get remote contents info list (err=0x" << std::hex << resList << std::dec << ")" << std::endl;
-	  if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
-	  return;
-	}
+    // Robust fetch: date list -> latest day -> contents for that day
+    SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0; SDK::CrError resList = SDK::CrError_None;
+    const int max_attempts = 10;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+      SDK::CrCaptureDate *dateList = nullptr; CrInt32u dateNums = 0;
+      SDK::CrError derr = SDK::GetRemoteTransferCapturedDateList(handle, slot, &dateList, &dateNums);
+      if (derr == SDK::CrError_None && dateList && dateNums > 0) {
+        // pick latest by Y/M/D
+        SDK::CrCaptureDate latest = dateList[0];
+        for (CrInt32u i = 1; i < dateNums; ++i) {
+          const auto &D = dateList[i];
+          if ((D.year > latest.year) ||
+          (D.year == latest.year && D.month > latest.month) ||
+          (D.year == latest.year && D.month == latest.month && D.day > latest.day)) {
+        latest = D;
+          }
+        }
+        resList = SDK::GetRemoteTransferContentsInfoList(handle, slot, SDK::CrGetContentsInfoListType_Range_Day, &latest, 0, &list, &count);
+        SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
+        if (resList == SDK::CrError_None && list && count > 0) break;
+        if (list) { SDK::ReleaseRemoteTransferContentsInfoList(handle, list); list = nullptr; count = 0; }
+      } else {
+        if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
+    }
+    if (resList != SDK::CrError_None || !list || count == 0) {
+      LOGE( "[ERROR] Failed to get remote contents info list (err=0x" << std::hex << resList << std::dec << ")" );
+      if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
+      return;
+    }
 
-	// pick newest N = addSize (or 1)
-	CrInt32u want = (addSize > 0 ? addSize : 1);
-	std::vector<CrInt32u> idx(count);
-	for (CrInt32u i = 0; i < count; ++i) idx[i] = i;
-	std::sort(idx.begin(), idx.end(), [&](CrInt32u a, CrInt32u b) {
-	  const auto &A = list[a].modificationDatetimeUTC;
-	  const auto &B = list[b].modificationDatetimeUTC;
-	  if (A.year != B.year) return A.year > B.year;
-	  if (A.month != B.month) return A.month > B.month;
-	  if (A.day != B.day) return A.day > B.day;
-	  if (A.hour != B.hour) return A.hour > B.hour;
-	  if (A.minute != B.minute) return A.minute > B.minute;
-	  if (A.sec != B.sec) return A.sec > B.sec;
-	  return A.msec > B.msec;
-	});
-	if (want > idx.size()) want = static_cast<CrInt32u>(idx.size());
-	idx.resize(want);
+    // pick newest N = addSize (or 1)
+    CrInt32u want = (addSize > 0 ? addSize : 1);
+    std::vector<CrInt32u> idx(count);
+    for (CrInt32u i = 0; i < count; ++i) idx[i] = i;
+    std::sort(idx.begin(), idx.end(), [&](CrInt32u a, CrInt32u b) {
+      const auto &A = list[a].modificationDatetimeUTC;
+      const auto &B = list[b].modificationDatetimeUTC;
+      if (A.year != B.year) return A.year > B.year;
+      if (A.month != B.month) return A.month > B.month;
+      if (A.day != B.day) return A.day > B.day;
+      if (A.hour != B.hour) return A.hour > B.hour;
+      if (A.minute != B.minute) return A.minute > B.minute;
+      if (A.sec != B.sec) return A.sec > B.sec;
+      return A.msec > B.msec;
+    });
+    if (want > idx.size()) want = static_cast<CrInt32u>(idx.size());
+    idx.resize(want);
 
-	for (CrInt32u k = 0; k < want; ++k) {
-	  const SDK::CrContentsInfo &target = list[idx[k]];
-	  if (target.contentId == 0) continue;
+    for (CrInt32u k = 0; k < want; ++k) {
+      const SDK::CrContentsInfo &target = list[idx[k]];
+      if (target.contentId == 0) continue;
 
-	  for (CrInt32u fi = 0; fi < target.filesNum; ++fi) {
-	    dl_waiting = true;
-	    CrInt32u fileId = target.files[fi].fileId;
+      for (CrInt32u fi = 0; fi < target.filesNum; ++fi) {
+        dl_waiting = true;
+        CrInt32u fileId = target.files[fi].fileId;
 
-	    // determine original filename
-	    std::string orig = basename_from_path(target.files[fi].filePath);
-	    if (orig.empty()) {
-	      std::ostringstream o; o << "content_" << (unsigned long long)target.contentId << "_file_" << fileId;
-	      orig = o.str();
-	    }
-	    std::string finalName = unique_name(g_download_dir, orig);
-	    CrChar *saveDir = g_download_dir.empty() ? nullptr : const_cast<CrChar *>(reinterpret_cast<const CrChar *>(g_download_dir.c_str()));
-	    SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(handle, slot, target.contentId, fileId, 0x1000000, saveDir, const_cast<CrChar *>(finalName.c_str()));
-	    if (dres != SDK::CrError_None) {
-	      std::cerr << "[ERROR] GetRemoteTransferContentsDataFile failed (0x" << std::hex << dres << std::dec << ")" << std::endl;
-	      dl_waiting = false;
-	      continue;
-	    }
-	    {
-	      std::unique_lock<std::mutex> lk(dl_mtx);
-	      dl_cv.wait(lk, [&] { return !dl_waiting || g_stop.load(); });
-	    }
-	    if (dl_notify_code == SDK::CrNotify_RemoteTransfer_Result_OK) {
-	      std::string saved = last_downloaded_file;
-	      std::string base = saved;
-	      size_t pos = base.find_last_of("/\\"); if (pos != std::string::npos) base = base.substr(pos + 1);
-	      long long sizeB = 0; struct stat st{}; if (::stat(saved.c_str(), &st) == 0) sizeB = (long long)st.st_size;
-	      std::cout << "[PHOTO] " << base << " (" << sizeB << " bytes)" << std::endl;
+        // determine original filename
+        std::string orig = basename_from_path(target.files[fi].filePath);
+        if (orig.empty()) {
+          std::ostringstream o; o << "content_" << (unsigned long long)target.contentId << "_file_" << fileId;
+          orig = o.str();
+        }
+        std::string finalName = unique_name(g_download_dir, orig);
+        CrChar *saveDir = g_download_dir.empty() ? nullptr : const_cast<CrChar *>(reinterpret_cast<const CrChar *>(g_download_dir.c_str()));
+        SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(handle, slot, target.contentId, fileId, 0x1000000, saveDir, const_cast<CrChar *>(finalName.c_str()));
+        if (dres != SDK::CrError_None) {
+          LOGE( "[ERROR] GetRemoteTransferContentsDataFile failed (0x" << std::hex << dres << std::dec << ")" );
+          dl_waiting = false;
+          continue;
+        }
+        {
+          std::unique_lock<std::mutex> lk(dl_mtx);
+          dl_cv.wait(lk, [&] { return !dl_waiting || g_stop.load(); });
+        }
+        if (dl_notify_code == SDK::CrNotify_RemoteTransfer_Result_OK) {
+          std::string saved = last_downloaded_file;
+          std::string base = saved;
+          size_t pos = base.find_last_of("/\\"); if (pos != std::string::npos) base = base.substr(pos + 1);
+          long long sizeB = 0; struct stat st{}; if (::stat(saved.c_str(), &st) == 0) sizeB = (long long)st.st_size;
+          LOGI( "[PHOTO] " << base << " (" << sizeB << " bytes)" );
 
-	      // Run post-download hook if provided
-	      if (!g_post_cmd.empty()) {
-		run_post_cmd(g_post_cmd, saved);
-	      }
-	    } else if (!g_stop.load()) {
-	      std::cerr << "[ERROR] Download failed (notify=0x" << std::hex << dl_notify_code << std::dec << ")" << std::endl;
-	    }
-	  }
-	}
+          // Run post-download hook if provided
+          if (!g_post_cmd.empty()) {
+        run_post_cmd(g_post_cmd, saved);
+          }
+        } else if (!g_stop.load()) {
+          LOGE( "[ERROR] Download failed (notify=0x" << std::hex << dl_notify_code << std::dec << ")" );
+        }
+      }
+    }
 
-	SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
+    SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
       });
     } catch (...) {
-      std::cerr << "[ERROR] Failed to create download thread" << std::endl;
+      LOGE( "[ERROR] Failed to create download thread" );
     }
   }
 
@@ -405,41 +515,41 @@ private:
 
 // Attempt a single connect (by direct IP or enumeration). Returns true on success.
 static bool try_connect_once(const std::string &explicit_ip,
-                             const std::string &explicit_mac,
-                             const std::string &download_dir,
-                             bool verbose,
-                             QuietCallback &cb,
-                             SDK::CrDeviceHandle &handle,
-                             const SDK::ICrCameraObjectInfo *&selected,
-                             SDK::ICrEnumCameraObjectInfo *&enum_list,
-                             SDK::ICrCameraObjectInfo *&created) {
+                            const std::string &explicit_mac,
+                            const std::string &download_dir,
+                            bool verbose,
+                            QuietCallback &cb,
+                            SDK::CrDeviceHandle &handle,
+                            const SDK::ICrCameraObjectInfo *&selected,
+                            SDK::ICrEnumCameraObjectInfo *&enum_list,
+                            SDK::ICrCameraObjectInfo *&created) {
   cb.verbose = verbose;
   SDK::CrError err = SDK::CrError_None;
   selected = nullptr; enum_list = nullptr; created = nullptr; handle = 0;
 
   const bool using_direct_ip = !explicit_ip.empty();
   if (!using_direct_ip) {
-    std::cout << "Searching for cameras..." << std::endl;
+    LOGI( "Searching for cameras..." );
     err = SDK::EnumCameraObjects(&enum_list, 1);
     if (err != SDK::CrError_None || !enum_list || enum_list->GetCount() == 0) {
-      std::cerr << "No cameras found (EnumCameraObjects)" << std::endl;
+      LOGE( "No cameras found (EnumCameraObjects)" );
       return false;
     }
     selected = enum_list->GetCameraObjectInfo(0);
   } else {
-    std::cout << "Connecting with camera at " << explicit_ip << "..." << std::endl;
+    LOGI( "Connecting with camera at " << explicit_ip << "..." );
     CrInt32u ipAddr = ip_to_uint32(explicit_ip);
     if (!ipAddr) {
-      std::cerr << "Bad IP" << std::endl; return false;
+      LOGE( "Bad IP" ); return false;
     }
     unsigned char mac[6] = {0, 0, 0, 0, 0, 0};
     if (!explicit_mac.empty() && !parse_mac(explicit_mac, mac)) {
-      std::cerr << "WARN bad MAC, ignoring: " << explicit_mac << std::endl;
+      LOGE( "WARN bad MAC, ignoring: " << explicit_mac );
     }
     SDK::CrCameraDeviceModelList model = SDK::CrCameraDeviceModel_ILCE_6700;
     err = SDK::CreateCameraObjectInfoEthernetConnection(&created, model, ipAddr, mac, 0);
     if (err != SDK::CrError_None || !created) {
-      std::cerr << "CreateCameraObjectInfoEthernetConnection failed" << std::endl;
+      LOGE( "CreateCameraObjectInfoEthernetConnection failed" );
       return false;
     }
     selected = created;
@@ -451,10 +561,10 @@ static bool try_connect_once(const std::string &explicit_ip,
   if (load_fingerprint(fp_path, fp_buf)) { fp_ptr = (CrChar *)fp_buf.data(); fp_len = (CrInt32u)fp_buf.size(); }
 
   err = SDK::Connect(const_cast<SDK::ICrCameraObjectInfo *>(selected), &cb, &handle,
-		     SDK::CrSdkControlMode_RemoteTransfer, SDK::CrReconnecting_ON,
-		     nullptr, nullptr, fp_ptr, fp_len);
+            SDK::CrSdkControlMode_RemoteTransfer, SDK::CrReconnecting_ON,
+            nullptr, nullptr, fp_ptr, fp_len);
   if (err != SDK::CrError_None || !handle) {
-    std::cerr << "Connect failed: 0x" << std::hex << err << std::dec << std::endl;
+    LOGE( "Connect failed: 0x" << std::hex << err << std::dec );
     return false;
   }
 
@@ -464,14 +574,16 @@ static bool try_connect_once(const std::string &explicit_ip,
     cb.conn_cv.wait_for(lk, std::chrono::seconds(12), [&] { return cb.connected || cb.conn_finished || g_stop.load(); });
   }
   if (!cb.connected) {
-    std::cerr << "Camera not available";
-    if (cb.last_error_code) std::cerr << " error=0x" << std::hex << cb.last_error_code << std::dec;
-    std::cerr << std::endl;
+    std::ostringstream _m;
+    _m << "Camera not available";
+    if (cb.last_error_code) _m << " error=0x" << std::hex << cb.last_error_code << std::dec;
+    LOGE( _m.str() );
+    
     return false;
   }
 
   cb.device_handle = handle;
-  std::cout << "Connected. Ctrl+C to stop." << std::endl;
+  LOGI( "Connected. Ctrl+C to stop." );
 
   // persist fingerprint
   {
@@ -485,8 +597,8 @@ static bool try_connect_once(const std::string &explicit_ip,
 }
 
 static void disconnect_and_release(SDK::CrDeviceHandle &handle,
-                                   SDK::ICrCameraObjectInfo *&created,
-                                   SDK::ICrEnumCameraObjectInfo *&enum_list) {
+                                  SDK::ICrCameraObjectInfo *&created,
+                                  SDK::ICrEnumCameraObjectInfo *&enum_list) {
   if (handle) { SDK::Disconnect(handle); SDK::ReleaseDevice(handle); handle = 0; }
   if (created) { created->Release(); created = nullptr; }
   if (enum_list) { enum_list->Release(); enum_list = nullptr; }
@@ -559,7 +671,7 @@ int main(int argc, char **argv) {
   }
 
   if (!SDK::Init()) {
-    std::cerr << "Init failed" << std::endl;
+    LOGE( "Init failed" );
     return 1;
   }
   g_download_dir = download_dir;
@@ -583,119 +695,159 @@ int main(int argc, char **argv) {
     g_reconnect.store(false);
 
     bool ok = try_connect_once(explicit_ip, explicit_mac, download_dir, verbose, cb,
-			       handle, selected, enum_list, created);
+                  handle, selected, enum_list, created);
     if (!ok) {
       disconnect_and_release(handle, created, enum_list);
       if (g_keepalive.count() == 0) {
-	std::cerr << "Exiting (no keepalive)" << std::endl;
-	cleanup_sdk();
-	return 2;
+    LOGE( "Exiting (no keepalive)" );
+    cleanup_sdk();
+    return 2;
       }
-      std::cout << "Retrying in " << g_keepalive.count() << " ms..." << std::endl;
+      LOGI( "Retrying in " << g_keepalive.count() << " ms..." );
       std::this_thread::sleep_for(g_keepalive);
       continue;
     }
 
-    inputThread = std::thread([handle]() {
+    // Create wake pipe once per connection (or do it once at program start)
+if (g_wake_pipe[0] == -1) {
+  if (pipe(g_wake_pipe) == 0) {
+    fcntl(g_wake_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
+  } else {
+    // Pipe creation failed; logs just won’t wake the REPL (still works).
+  }
+}
 
+    inputThread = std::thread([handle]() {
+      
       unblock_sigint_in_this_thread();
       
       // history setup
       History* hist = history_init();
       HistEvent ev{};
       history(hist, &ev, H_SETSIZE, 1000);
-	
+
       // line editor setup
       EditLine* el = el_init("sonshell", stdin, stdout, stderr);
+      // Replace EL_SIGNAL with our getchar (signal handling is fine to keep too)
+      el_set(el, EL_GETCFN, my_getc);
       el_set(el, EL_PROMPT, &prompt);
       el_set(el, EL_EDITOR, "emacs");  // or "vi"
       el_set(el, EL_HIST, history, hist);
       el_set(el, EL_SIGNAL, 1); // let libedit cooperate with signals
-	
+
       // bind tab to our completion function
       el_set(el, EL_ADDFN, "my-complete", "Complete commands", &complete);
       el_set(el, EL_BIND, "\t", "my-complete", NULL);
+
+      g_repl_active.store(true, std::memory_order_relaxed);
+
+      // First flush of any queued messages that arrived between connect and REPL start (no refresh)
+      (void)drain_logs_and_refresh(nullptr);
 
       // bind commands to code
       Context ctx;
       using Handler = std::function<int(const std::vector<std::string>&)>;
       std::unordered_map<std::string, Handler> cmd{
-	{"shoot", [&](auto const& args)->int {
-	  //if (args.size() < 2) { std::cerr << "usage: connect <host>\n"; return 2; }
-	  ctx.handle = handle;
+    {"shoot", [&](auto const& args)->int {
+      //if (args.size() < 2) { std::cerr << "usage: connect <host>\n"; return 2; }
+      ctx.handle = handle;
 
-	  SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Down);
-	  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-	  SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Up);
-	  std::cout << "Shutter triggered." << std::endl;
-	    
-	  return 0;
-	}},
-	{"focus", [&](auto const& args)->int {
-	  //if (args.size() < 2) { std::cerr << "usage: capture start|stop\n"; return 2; }
-	  //if (args[1] == "start") { std::cout << "Capture started\n"; }
-	  //else if (args[1] == "stop") { std::cout << "Capture stopped\n"; }
-	  //else { std::cerr << "unknown capture subcommand\n"; return 2; }
+      SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Down);
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Up);
+      LOGI( "Shutter triggered." );
 
-	  ctx.handle = handle;
-	  SDK::CrDeviceProperty prop;
-	  prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
-	  prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
-	  prop.SetValueType(SDK::CrDataType::CrDataType_UInt16);
-	  SDK::SetDeviceProperty(handle, &prop);
-	  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-	  prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-	  SDK::SetDeviceProperty(handle, &prop);
-	  std::cout << "Autofocus activated." << std::endl;
-	    
-	  return 0;
-	}},
-	{"quit", [&](auto const&)->int { 
-	  std::cout << "bye\n"; 
-	  g_stop.store(true, std::memory_order_relaxed);   // <<< unify shutdown
-	  return 99; 
-	}},
-	{"exit", [&](auto const&)->int { 
-	  g_stop.store(true, std::memory_order_relaxed);   // <<< unify shutdown
-	  return 99; 
-	}},
+      return 0;
+    }},
+    {"focus", [&](auto const& args)->int {
+      //if (args.size() < 2) { std::cerr << "usage: capture start|stop\n"; return 2; }
+      //if (args[1] == "start") { std::cout << "Capture started\n"; }
+      //else if (args[1] == "stop") { std::cout << "Capture stopped\n"; }
+      //else { std::cerr << "unknown capture subcommand\n"; return 2; }
+
+      ctx.handle = handle;
+      SDK::CrDeviceProperty prop;
+      prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
+      prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
+      prop.SetValueType(SDK::CrDataType::CrDataType_UInt16);
+      SDK::SetDeviceProperty(handle, &prop);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+      SDK::SetDeviceProperty(handle, &prop);
+      LOGI( "Autofocus activated." );
+
+      return 0;
+    }},
+    {"quit", [&](auto const&)->int {
+      g_stop.store(true, std::memory_order_relaxed);   // <<< unify shutdown
+      return 99;
+    }},
+    {"exit", [&](auto const&)->int {
+      g_stop.store(true, std::memory_order_relaxed);   // <<< unify shutdown
+      return 99;
+    }},
       };
-	
-      int count = 0;
+
       while (!g_stop.load(std::memory_order_relaxed)) {
-	int count = 0;
-	errno = 0;
-	const char* s = el_gets(el, &count);
 
-	if (!s) {
-	  if (errno == EINTR && g_stop.load()) break; // Ctrl-C now interrupts here
-	  if (errno == EINTR) continue;
-	  g_stop.store(true); break;                  // EOF → quit
-	}
-	
-	std::string line(s, count);
-	if (!line.empty() && line.back() == '\n') line.pop_back();
-	if (line.empty()) continue;
+        // Print logs that arrived just before we read; NO refresh here to avoid double prompt
+        (void)drain_logs_and_refresh(nullptr);
 
-	history(hist, &ev, H_ENTER, line.c_str());
+    int count = 0;
+    errno = 0;
+    const char* s = el_gets(el, &count);
 
-	auto args = tokenize(line);
-	auto it = cmd.find(args[0]);
-	if (it == cmd.end()) {
-	  std::cerr << "Unknown command: " << args[0] << "\n";
-	  continue;
-	}
-	int rc = it->second(args);
-	if (rc == 99) break;  // already set g_stop above
+    if (!s) {
+      if (g_stop.load()) break;
+      if (errno == EINTR) continue;
+      if (feof(stdin)) { g_stop.store(true); break; }
+
+      // Fully drain wake pipe and clear the pending flag
+      if (g_wake_pipe[0] != -1) {
+        char buf[256];
+        while (true) {
+          ssize_t n = read(g_wake_pipe[0], buf, sizeof(buf));
+          if (n <= 0) break;
+        }
+      }
+      g_wake_pending.store(false, std::memory_order_relaxed);
+
+      // Print any queued logs, but DO NOT refresh here (to avoid duplicate prompts)
+      (void)drain_logs_and_refresh(nullptr);
+
+      // Go back to el_gets(); it will draw the prompt exactly once.
+      continue;
+    }
+
+    std::string line(s, count);
+    if (!line.empty() && line.back() == '\n') line.pop_back();
+    if (line.empty()) continue;
+
+    history(hist, &ev, H_ENTER, line.c_str());
+
+    auto args = tokenize(line);
+    auto it = cmd.find(args[0]);
+    if (it == cmd.end()) {
+      LOGE("Unknown command: " << args[0]);
+      continue;
+    }
+    int rc = it->second(args);
+    if (rc == 99) break;  // already set g_stop above
+
+    // print logs produced by the command, then repaint prompt
+    drain_logs_and_refresh(el);
       }
 
-      std::cout << "Stopping input thread..." << std::endl;
-	
+      LOGI( "Stopping input thread..." );
+
       history_end(hist);
       el_end(el);
 
-      std::cout << "Stopped input thread." << std::endl;
-	
+      g_repl_active.store(false, std::memory_order_relaxed);
+
+      LOGI( "Stopped input thread." );
+
     });
 
     // Connected: wait until stop or disconnect signaled
@@ -703,7 +855,7 @@ int main(int argc, char **argv) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    std::cout << "Shutting down connection..." << std::endl;
+    LOGI( "Shutting down connection..." );
     disconnect_and_release(handle, created, enum_list);
 
     for (auto &t : g_downloadThreads) {
@@ -715,18 +867,21 @@ int main(int argc, char **argv) {
       inputThread.join();
     }
 
+    if (g_wake_pipe[0] != -1) { close(g_wake_pipe[0]); g_wake_pipe[0] = -1; }
+    if (g_wake_pipe[1] != -1) { close(g_wake_pipe[1]); g_wake_pipe[1] = -1; }
+
     if (g_stop.load()) break;
 
     if (g_keepalive.count() == 0) {
-      std::cerr << "Disconnected and keepalive disabled; exiting." << std::endl;
+      LOGE( "Disconnected and keepalive disabled; exiting." );
       break;
     }
 
-    std::cout << "Disconnected; will retry in " << g_keepalive.count() << " ms..." << std::endl;
+    LOGI( "Disconnected; will retry in " << g_keepalive.count() << " ms..." );
     std::this_thread::sleep_for(g_keepalive);
   }
 
-  std::cout << "Shutting down..." << std::endl;
+  LOGI( "Shutting down..." );
   for (auto &t : g_downloadThreads) {
     if (t.joinable()) t.join();
   }
