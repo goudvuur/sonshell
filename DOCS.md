@@ -87,7 +87,7 @@ Implements the Camera Remote SDK callback surface:
 ```
 --dir <path>          Directory to save files (required in most real setups)
 --ip <addr>           Connect directly to camera at IPv4 (e.g., 192.168.10.184)
---mac <hex:mac>       Optional MAC (e.g., 10:32:2c:2a:1a:6d) for direct IP
+--mac <hex:mac>       Optional MAC (e.g., 10:20:30:40:50:60) for direct IP
 --cmd <path>          Executable/script called after each download with 1 arg
 --keepalive <millis>  Retry interval when offline or after disconnect
 -v, --verbose         Verbose property-change logging
@@ -98,13 +98,13 @@ Implements the Camera Remote SDK callback surface:
 * Enumerate and keep trying every 2s; run a hook after each file:
 
 ```
-./`sonshell` --dir /photos --keepalive 2000 --cmd /usr/local/bin/ingest-photo
+./sonshell --dir /photos --keepalive 2000 --cmd /usr/local/bin/ingest-photo
 ```
 
 * Direct IP connect, verbose, try again every 3s:
 
 ```
-./`sonshell` --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /photos -v --keepalive 3000
+./sonshell --ip 192.168.1.1 --mac 10:20:30:40:50:60 --dir /photos -v --keepalive 3000
 ```
 
 ## Build

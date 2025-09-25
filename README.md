@@ -22,8 +22,8 @@ It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, 
 
 ### Options
 - `--dir <path>` : Directory to save files (required in most real setups).
-- `--ip <addr>` : Connect directly by IPv4 (e.g. `192.168.10.184`).
-- `--mac <hex:mac>` : Optional MAC (e.g. `10:32:2c:2a:1a:6d`) for direct IP.
+- `--ip <addr>` : Connect directly by IPv4 (e.g. `192.168.1.1`).
+- `--mac <hex:mac>` : Optional MAC (e.g. `10:20:30:40:50:60`) for direct IP.
 - `--cmd <path>` : Executable/script to run after each download, invoked as
   `cmd /photos/DSC01234.JPG`
 - `--keepalive <ms>` : Retry interval when offline or after disconnect.
@@ -37,7 +37,7 @@ Enumerate + keep retrying every 2s, run a hook after each file:
 
 Direct IP connect, verbose logs, retry every 3s:
 ```bash
-./sonshell --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /tmp/photos -v --keepalive 3000
+./sonshell --ip 192.168.1.1 --mac 10:20:30:40:50:60 --dir /tmp/photos -v --keepalive 3000
 ```
 
 ---
