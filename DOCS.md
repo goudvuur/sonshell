@@ -90,6 +90,10 @@ Implements the Camera Remote SDK callback surface:
 --mac <hex:mac>       Optional MAC (e.g., 10:20:30:40:50:60) for direct IP
 --cmd <path>          Executable/script called after each download with 1 arg
 --keepalive <millis>  Retry interval when offline or after disconnect
+--boot-pull <N>       On startup, download the latest N files from each slot
+                      (skip if file already exists locally; post-boot reverts
+                      to numeric suffix naming). Runs asynchronously and is
+                      cancelable with Ctrl-C.
 -v, --verbose         Verbose property-change logging
 ```
 

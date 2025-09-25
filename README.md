@@ -27,6 +27,10 @@ It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, 
 - `--cmd <path>` : Executable/script to run after each download, invoked as
   `cmd /photos/DSC01234.JPG`
 - `--keepalive <ms>` : Retry interval when offline or after disconnect.
+- `--boot-pull <N>` : On startup, download the latest **N** files from each slot.
+   * During boot, files already present locally are **skipped**.
+   * After boot, new incoming files always use **numeric suffixes** if needed.
+   * Boot downloads run asynchronously and can be cancelled with Ctrl-C.
 - `-v`, `--verbose` : Verbose property-change logging.
 
 ### Examples
