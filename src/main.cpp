@@ -55,6 +55,8 @@ static int g_wake_pipe[2] = {-1, -1};
 static std::atomic<bool> g_repl_active{false};
 static std::atomic<bool> g_wake_pending{false};
 static std::atomic<bool> g_boot_pull_only_missing{false};
+static std::atomic<int>  g_boot_tokens{0};   // how many callbacks are marked as boot-spawned
+static std::atomic<int>  g_boot_active{0};   // how many boot-spawned workers are still running
 
 // ----------------------------
 // Logging
@@ -404,8 +406,22 @@ public:
     LOGI( "[CB] ContentsListChanged: notify=0x" << std::hex << notify << std::dec << " slot=" << slotNumber << " add=" << addSize );
     if (notify != SDK::CrNotify_RemoteTransfer_Changed_Add) return;
 
+    // Was this invocation triggered by boot-pull?
+    bool is_boot = false;
+    for (int tok = g_boot_tokens.load(std::memory_order_relaxed); tok > 0; ) {
+      if (g_boot_tokens.compare_exchange_weak(tok, tok - 1, std::memory_order_relaxed)) {
+	is_boot = true;
+	break;
+      }
+    }
+    
     try {
-      g_downloadThreads.emplace_back([this, slotNumber, addSize]() {
+      g_downloadThreads.emplace_back([this, slotNumber, addSize, is_boot]() {
+	if (is_boot) g_boot_active.fetch_add(1, std::memory_order_relaxed);
+	auto _boot_guard = std::unique_ptr<void, void(*)(void*)>{nullptr, [](void*) {
+	  if (g_boot_active.load(std::memory_order_relaxed) > 0)
+	    g_boot_active.fetch_sub(1, std::memory_order_relaxed);
+	}};
 	SDK::CrDeviceHandle handle = this->device_handle;
 	if (!handle) return;
 	SDK::CrSlotNumber slot = (slotNumber == SDK::CrSlotNumber_Slot2) ? SDK::CrSlotNumber_Slot2 : SDK::CrSlotNumber_Slot1;
@@ -490,18 +506,15 @@ public:
 	    // Normal (post-boot) behavior: use unique_name() to add numeric suffixes.
 	    std::string targetPath = join_path(g_download_dir, orig);
 	    std::string finalName;
-	    if (g_boot_pull_only_missing.load(std::memory_order_relaxed)) {
+	    if (is_boot) {
 	      if (std::filesystem::exists(targetPath)) {
 		LOGI("[SKIP] already present: " << orig);
 		dl_waiting = false;
 		continue;
 	      }
-	      // keep original name during boot-pull
-	      finalName = orig;
-	    }
-	    else {
-	      // normal suffixing
-	      finalName = unique_name(g_download_dir, orig);
+	      finalName = orig;                         // keep original name during boot-pull
+	    } else {
+	      finalName = unique_name(g_download_dir, orig); // normal suffixing after boot
 	    }
 	    
 	    CrChar *saveDir = g_download_dir.empty() ? nullptr : const_cast<CrChar *>(reinterpret_cast<const CrChar *>(g_download_dir.c_str()));
@@ -793,25 +806,19 @@ int main(int argc, char **argv) {
 	LOGI("Boot-pull (async): latest " << boot_pull << " item(s) per slot (skip existing)...");
 	g_boot_pull_only_missing.store(true, std::memory_order_relaxed);
 
+	// Arm exactly two boot tokens for the two callback invocations
+	g_boot_tokens.store(2, std::memory_order_relaxed);
+	
 	// Kick off both slots (reuses the same code path as live notifications)
 	cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
 						     SDK::CrSlotNumber_Slot1, boot_pull);
 	cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
 						     SDK::CrSlotNumber_Slot2, boot_pull);
 
-	// Exit the polling loop immediately on Ctrl-C
-	while (!g_stop.load(std::memory_order_relaxed)) {
-	  bool any_joinable = false;
-	  for (size_t i = start_threads; i < g_downloadThreads.size(); ++i) {
-	    if (g_downloadThreads[i].joinable()) { any_joinable = true; break; }
-	  }
-	  if (!any_joinable) break;
+	// Wait until all boot workers are done OR user pressed Ctrl-C
+	while (!g_stop.load(std::memory_order_relaxed) &&
+	       g_boot_active.load(std::memory_order_relaxed) > 0) {
 	  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	}
-
-	// Final sweep: join everything started for boot-pull
-	for (size_t i = start_threads; i < g_downloadThreads.size(); ++i) {
-	  if (g_downloadThreads[i].joinable()) g_downloadThreads[i].join();
 	}
 
 	g_boot_pull_only_missing.store(false, std::memory_order_relaxed);
