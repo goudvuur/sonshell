@@ -1,4 +1,4 @@
-# SonyShell - an effort to "ssh into my Sony camera"
+# SonShell - an effort to "ssh into my Sony camera"
 
 A Linux-only helper built on Sony’s official **Camera Remote SDK**.
 It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, downloads them automatically, and can optionally run a script on each downloaded file.
@@ -60,7 +60,7 @@ g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
 
 ## How It Works (short version)
 1. **Connect** to the camera (via IP or enumeration).
-   Stores/reuses SDK **fingerprint** under `~/.cache/sonyshell/`.
+   Stores/reuses SDK **fingerprint** under `~/.cache/sonshell/`.
 2. **Wait for notifications**: when the camera signals new contents,
    spawn a download thread.
 3. **Download** newest files to `--dir`.

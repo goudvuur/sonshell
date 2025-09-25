@@ -103,7 +103,7 @@ static std::string unique_name(const std::string &dir, const std::string &base) 
 
 static std::string get_cache_dir() {
     const char *h = std::getenv("HOME");
-    if (h) return std::string(h) + "/.cache/sonyshell";
+    if (h) return std::string(h) + "/.cache/sonshell";
     return ".";
 }
 

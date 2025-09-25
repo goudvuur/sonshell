@@ -1,6 +1,6 @@
-# SonyShell — Developer Guide
+# SonShell — Developer Guide
 
-This document explains how the cleaned Linux-only helper works so you can extend it quickly. The code lives in **sony-a6700-remote-cleaned.cpp**.
+This document explains how the cleaned Linux-only helper works so you can extend it quickly.
 
 ## High-level overview
 
@@ -34,7 +34,7 @@ The program connects to a Sony camera via the Camera Remote SDK, monitors for ne
 ### 3) Filesystem helpers
 
 * `join_path`, `file_exists`, `basename_from_path`, and `unique_name` keep naming and path logic simple and POSIX-friendly.
-* Fingerprint cache stored under `$HOME/.cache/sonyshell` to speed up/solidify trust on subsequent connects.
+* Fingerprint cache stored under `$HOME/.cache/sonshell` to speed up/solidify trust on subsequent connects.
 
 ### 4) Network helpers
 
@@ -134,5 +134,5 @@ g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
 
 * **Permissions**: Ensure `--dir` is writable and your hook is executable.
 * **Network**: Direct IP mode assumes camera is reachable and in the correct SDK mode.
-* **Fingerprint mismatch**: If connection fails mysteriously, try deleting the cached fingerprint at `~/.cache/sonyshell/fp_enumerated.bin` and reconnecting.
+* **Fingerprint mismatch**: If connection fails mysteriously, try deleting the cached fingerprint at `~/.cache/sonshell/fp_enumerated.bin` and reconnecting.
 
