@@ -802,6 +802,8 @@ if (g_wake_pipe[0] == -1) {
       if (g_stop.load()) break;
       if (errno == EINTR) continue;
       if (feof(stdin)) { g_stop.store(true); break; }
+      // Ctrl-D / EOF at empty prompt: el_gets() -> NULL, count==0, errno==0
+      if (count == 0 && errno == 0) { g_stop.store(true); break; }
 
       // Fully drain wake pipe and clear the pending flag
       if (g_wake_pipe[0] != -1) {
@@ -839,14 +841,13 @@ if (g_wake_pipe[0] == -1) {
     drain_logs_and_refresh(el);
       }
 
-      LOGI( "Stopping input thread..." );
-
       history_end(hist);
       el_end(el);
 
       g_repl_active.store(false, std::memory_order_relaxed);
 
-      LOGI( "Stopped input thread." );
+      // makes sure the next shutdown line is printed on the next line, not next to the prompt
+      LOGI("");
 
     });
 

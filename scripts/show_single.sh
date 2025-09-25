@@ -95,7 +95,7 @@ if ! grep -q -- "$(printf '%s' "$FILE" | sed 's/[].[^$*\/]/\\&/g')" <<<"$cmd"; t
   cmd="$cmd $file_quoted"
 fi
 
-echo "Showing image $FILE"
+# DEBUG echo "Showing image $FILE"
 
 # --- Tag environment variable for child process ---
 SAFE_NAME=${SCRIPT_NAME^^}                # uppercase
