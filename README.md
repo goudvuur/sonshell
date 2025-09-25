@@ -17,7 +17,7 @@ It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, 
 
 ## Usage
 ```bash
-./sony-remote --dir /photos [options]
+./sonshell --dir /photos [options]
 ```
 
 ### Options
@@ -32,13 +32,23 @@ It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, 
 ### Examples
 Enumerate + keep retrying every 2s, run a hook after each file:
 ```bash
-./sony-remote --dir /photos --keepalive 2000 --cmd /usr/local/bin/ingest-photo
+./sonshell --dir /photos --keepalive 2000 --cmd /usr/local/bin/ingest-photo
 ```
 
 Direct IP connect, verbose logs, retry every 3s:
 ```bash
-./sony-remote --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /photos -v --keepalive 3000
+./sonshell --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /photos -v --keepalive 3000
 ```
+
+---
+
+## Interactive Commands
+
+Once connected, you enter the interactive **SonShell** prompt:
+
+- `shoot` : Trigger shutter release.
+- `focus` : Trigger autofocus (half-press behavior).
+- `quit` or `exit` : Leave the shell and stop the program.
 
 ---
 
@@ -50,10 +60,10 @@ See [INSTALL.md](./INSTALL.md)
 or (untested)
 
 ```bash
-g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
+g++ -std=c++17 sonshell.cpp \
     -I/path/to/CrSDK/include \
     -L/path/to/CrSDK/lib -lCameraRemoteSDK \
-    -lpthread -o sony-remote
+    -lpthread -o sonshell
 ```
 
 ---

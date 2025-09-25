@@ -98,13 +98,13 @@ Implements the Camera Remote SDK callback surface:
 * Enumerate and keep trying every 2s; run a hook after each file:
 
 ```
-./sony-remote --dir /photos --keepalive 2000 --cmd /usr/local/bin/ingest-photo
+./`sonshell` --dir /photos --keepalive 2000 --cmd /usr/local/bin/ingest-photo
 ```
 
 * Direct IP connect, verbose, try again every 3s:
 
 ```
-./sony-remote --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /photos -v --keepalive 3000
+./`sonshell` --ip 192.168.10.184 --mac 10:32:2c:2a:1a:6d --dir /photos -v --keepalive 3000
 ```
 
 ## Build
@@ -113,10 +113,21 @@ Implements the Camera Remote SDK callback surface:
 g++ -std=c++17 sony-a6700-remote-cleaned.cpp \
     -I/path/to/CrSDK/include \
     -L/path/to/CrSDK/lib -lCameraRemoteSDK \
-    -lpthread -o sony-remote
+    -lpthread -o `sonshell`
 ```
 
-## Error handling & logging
+## 
+
+## Interactive Prompt Commands
+
+When SonShell is running, you'll see a `sonshell>` prompt. Supported commands:
+
+- `shoot` — Triggers the shutter (press, brief hold, release).
+- `focus` — Performs an autofocus half-press (S1 lock, then release).
+- `quit` / `exit` — Cleanly shuts down the session and exits.
+
+(Use Tab for simple completion of known commands. History is preserved per session.)
+Error handling & logging
 
 * All SDK errors are logged with hex codes and (where available) decoded names.
 * Transfers log success with `[PHOTO] <name> (<size bytes>)`.
