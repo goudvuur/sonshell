@@ -54,9 +54,10 @@ static std::thread inputThread;
 static int g_wake_pipe[2] = {-1, -1};
 static std::atomic<bool> g_repl_active{false};
 static std::atomic<bool> g_wake_pending{false};
-static std::atomic<bool> g_boot_pull_only_missing{false};
-static std::atomic<int>  g_boot_tokens{0};   // how many callbacks are marked as boot-spawned
-static std::atomic<int>  g_boot_active{0};   // how many boot-spawned workers are still running
+static std::atomic<int>  g_sync_tokens{0};   // how many callbacks are marked as boot-spawned
+static std::atomic<int>  g_sync_active{0};   // how many boot-spawned workers are still running
+static std::atomic<bool> g_sync_all{false};
+static std::atomic<bool> g_sync_abort{false};
 
 // ----------------------------
 // Logging
@@ -122,7 +123,15 @@ static inline bool drain_logs_and_refresh(EditLine* el_or_null) {
   std::cout.flush();
   std::cerr.flush();
 
-  if (el_or_null) el_set(el_or_null, EL_REFRESH, 0);
+  if (el_or_null) {
+    // Ensure libedit’s buffer is empty, then repaint the prompt…
+    el_replacestr(el_or_null, "");
+    el_set(el_or_null, EL_REFRESH, 0);
+    // …and NOW clear any leftover characters to the right of the cursor.
+    std::fputs("\033[K", stdout); // prevents log output from slicing through a partially typed line
+    std::fflush(stdout);
+  }
+  
   return true;
 }
 
@@ -136,7 +145,7 @@ static inline void wait_for_logs_or_timeout(int ms) {
 }
 
 // poll()-based getchar so logs can wake the REPL
-static int my_getc(EditLine*, char* c) {
+static int my_getc(EditLine* el, char* c) {
   struct pollfd fds[2];
   int nfds = 1;
   fds[0].fd = STDIN_FILENO;   fds[0].events = POLLIN; fds[0].revents = 0;
@@ -146,21 +155,46 @@ static int my_getc(EditLine*, char* c) {
   for (;;) {
     int r = poll(fds, nfds, -1);
     if (r < 0) {
-      if (errno == EINTR) continue;   // try again
-      return -1;                      // error
+      if (errno == EINTR) {
+	if (g_stop.load(std::memory_order_relaxed)) return 0; // make el_gets() exit
+	continue; // spurious EINTR while not stopping
+      }
+      return -1;
     }
 
-    // Wake pipe: drain a chunk and signal "no char, try again"
+    // Wake pipe: drain, repaint prompt, and continue waiting for real input
     if (nfds == 2 && (fds[1].revents & POLLIN)) {
       char buf[256];
-      (void)read(g_wake_pipe[0], buf, sizeof(buf));
-      return -1;                      // wake (no char)
+      while (true) {
+	ssize_t n = read(g_wake_pipe[0], buf, sizeof(buf));
+	if (n <= 0) break;
+      }
+      g_wake_pending.store(false, std::memory_order_relaxed);
+      
+      (void)drain_logs_and_refresh(el);
+      
+      // NEW: if we're stopping, terminate read now
+      if (g_stop.load(std::memory_order_relaxed)) return 0;
+      
+      continue;
     }
 
     // Real input
     if (fds[0].revents & POLLIN) {
       ssize_t n = read(STDIN_FILENO, c, 1);
-      if (n == 1) return 1;           // <-- IMPORTANT: return COUNT = 1
+      if (n == 1) {
+	if (*c == 4) { // Ctrl-D -> EOF
+	  g_stop.store(true, std::memory_order_relaxed);
+	  return 0; // el_gets() sees EOF
+	}
+	if (*c == 3) { // Ctrl-C -> treat as EOF to avoid redraw
+	  g_stop.store(true, std::memory_order_relaxed);
+	  std::fputs("\n", stdout);  // drop the current line cleanly
+	  std::fflush(stdout);
+	  return 0; // el_gets() sees EOF and exits immediately
+	}
+	return 1;
+      }
       if (n == 0)  return 0;          // EOF
       if (errno == EINTR) continue;
       return -1;                      // error
@@ -173,6 +207,8 @@ static int my_getc(EditLine*, char* c) {
 // ----------------------------
 static void signal_handler(int) {
   g_stop.store(true, std::memory_order_relaxed);
+  // Nudge the REPL so my_getc() exits promptly
+  if (g_wake_pipe[1] != -1) { char x = 0; (void)!write(g_wake_pipe[1], &x, 1); }
 }
 
 static void install_signal_handlers() {
@@ -260,15 +296,17 @@ static bool save_fingerprint(const std::string &path, const char *data, size_t l
   return ofs.good();
 }
 
-static inline void interruptible_sleep(std::chrono::milliseconds total) {
-  using namespace std::chrono;
-  auto deadline = steady_clock::now() + total;
-  while (!g_stop.load(std::memory_order_relaxed)) {
-    auto now = steady_clock::now();
-    if (now >= deadline) break;
-    auto chunk = std::min(milliseconds(100), duration_cast<milliseconds>(deadline - now));
-    std::this_thread::sleep_for(chunk);
-  }
+static std::string dirname_from_path(const char *p) {
+  if (!p) return {};
+  std::string s(p);
+  // strip trailing slash(es)
+  while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+  size_t pos = s.find_last_of("/\\");
+  if (pos == std::string::npos || pos == 0) return {};  // empty or root-like
+  // drop any leading slash to keep it relative under g_download_dir
+  std::string d = s.substr(0, pos);
+  if (!d.empty() && (d[0] == '/' || d[0] == '\\')) d.erase(0, 1);
+  return d;
 }
 
 // ----------------------------
@@ -291,6 +329,21 @@ static bool parse_mac(const std::string &mac_str, unsigned char mac[6]) {
     mac[i] = static_cast<unsigned char>(v[i]);
   }
   return true;
+}
+
+// ----------------------------
+// Misc helpers
+// ----------------------------
+
+static inline void interruptible_sleep(std::chrono::milliseconds total) {
+  using namespace std::chrono;
+  auto deadline = steady_clock::now() + total;
+  while (!g_stop.load(std::memory_order_relaxed)) {
+    auto now = steady_clock::now();
+    if (now >= deadline) break;
+    auto chunk = std::min(milliseconds(100), duration_cast<milliseconds>(deadline - now));
+    std::this_thread::sleep_for(chunk);
+  }
 }
 
 // ----------------------------
@@ -328,7 +381,13 @@ public:
   CrInt32u dl_notify_code = 0;
   CrInt32u dl_progress = 0;
   std::string last_downloaded_file;
-
+  // inside class QuietCallback (near other dl_* fields)
+  CrInt32u dl_last_log_per = 101; // 0..100; 101 = "unset"
+  std::chrono::steady_clock::time_point dl_last_log_tp{};
+  std::string dl_current_label; // e.g., "PRIVATE/M4ROOT/CLIP/DSC01234.MP4"
+  std::chrono::steady_clock::time_point dl_start_tp{};
+  bool dl_any_progress = false;
+  
   void OnConnected(SDK::DeviceConnectionVersioin v) override {
     if (g_shutting_down.load()) return;
     if (verbose) LOGI( "[CB] OnConnected v=" << v );
@@ -406,34 +465,195 @@ public:
     LOGI( "[CB] ContentsListChanged: notify=0x" << std::hex << notify << std::dec << " slot=" << slotNumber << " add=" << addSize );
     if (notify != SDK::CrNotify_RemoteTransfer_Changed_Add) return;
 
-    // Was this invocation triggered by boot-pull?
-    bool is_boot = false;
-    for (int tok = g_boot_tokens.load(std::memory_order_relaxed); tok > 0; ) {
-      if (g_boot_tokens.compare_exchange_weak(tok, tok - 1, std::memory_order_relaxed)) {
-	is_boot = true;
+    // Was this invocation triggered by a manual sync?
+    bool is_sync = false;
+    for (int tok = g_sync_tokens.load(std::memory_order_relaxed); tok > 0; ) {
+      if (g_sync_tokens.compare_exchange_weak(tok, tok - 1, std::memory_order_relaxed)) {
+	is_sync = true;
 	break;
       }
     }
-    
+
+    bool sync_all = is_sync && g_sync_all.load(std::memory_order_relaxed);
+
     try {
-      g_downloadThreads.emplace_back([this, slotNumber, addSize, is_boot]() {
-	if (is_boot) g_boot_active.fetch_add(1, std::memory_order_relaxed);
+      g_downloadThreads.emplace_back([this, slotNumber, addSize, is_sync, sync_all]() {
+	if (is_sync) g_sync_active.fetch_add(1, std::memory_order_relaxed);
 	auto _boot_guard = std::unique_ptr<void, void(*)(void*)>{nullptr, [](void*) {
-	  if (g_boot_active.load(std::memory_order_relaxed) > 0)
-	    g_boot_active.fetch_sub(1, std::memory_order_relaxed);
+	  if (g_sync_active.load(std::memory_order_relaxed) > 0)
+	    g_sync_active.fetch_sub(1, std::memory_order_relaxed);
 	}};
 	SDK::CrDeviceHandle handle = this->device_handle;
 	if (!handle) return;
 	SDK::CrSlotNumber slot = (slotNumber == SDK::CrSlotNumber_Slot2) ? SDK::CrSlotNumber_Slot2 : SDK::CrSlotNumber_Slot1;
 
-	// Robust fetch: date list -> latest day -> contents for that day
-	SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0; SDK::CrError resList= SDK::CrError_None;
-	const int max_attempts = 10;
-	for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-	  if (g_stop.load(std::memory_order_relaxed)) {
-	    if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
+	auto process_list = [&](SDK::CrContentsInfo *list, CrInt32u count, CrInt32u want_hint) {
+	  if (!list || count == 0) return;
+
+	  if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	    LOGI("Sync: stopped (slot " << (int)slot << ").");
+	    return; // bail out before planning/logging
+	  }
+	  
+	  LOGI("[SYNC] slot " << (int)slot << ": planning " << count << " item(s)"
+	       << (sync_all ? " (all days)" : ""));
+	  
+	  // For "sync all", we want everything; otherwise keep your newest-first N logic
+	  CrInt32u want = (sync_all ? count : (want_hint > 0 ? want_hint : 1));
+
+	  std::vector<CrInt32u> idx(count);
+	  for (CrInt32u i = 0; i < count; ++i) idx[i] = i;
+
+	  if (!sync_all) {
+	    std::sort(idx.begin(), idx.end(), [&](CrInt32u a, CrInt32u b) {
+	      const auto &A = list[a].modificationDatetimeUTC;
+	      const auto &B = list[b].modificationDatetimeUTC;
+	      if (A.year != B.year) return A.year > B.year;
+	      if (A.month != B.month) return A.month > B.month;
+	      if (A.day != B.day) return A.day > B.day;
+	      if (A.hour != B.hour) return A.hour > B.hour;
+	      if (A.minute != B.minute) return A.minute > B.minute;
+	      if (A.sec != B.sec) return A.sec > B.sec;
+	      return A.msec > B.msec;
+	    });
+	    if (want > idx.size()) want = static_cast<CrInt32u>(idx.size());
+	    idx.resize(want);
+	  } else {
+	    // "all": process in natural order
+	    idx.resize(count);
+	  }
+
+	  for (CrInt32u k = 0; k < idx.size(); ++k) {
+
+	    if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	      dl_waiting = false;             // nothing in-flight yet for this file
+	      break;
+	    }
+	    
+	    if (g_stop.load(std::memory_order_relaxed)) break;
+	    const SDK::CrContentsInfo &target = list[idx[k]];
+	    if (target.contentId == 0) continue;
+
+	    for (CrInt32u fi = 0; fi < target.filesNum; ++fi) {
+
+	      if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+		dl_waiting = false;             // nothing in-flight yet for this file
+		break;
+	      }
+	      
+	      if (g_stop.load(std::memory_order_relaxed)) break;
+	      dl_waiting = true;
+	      CrInt32u fileId = target.files[fi].fileId;
+
+	      // determine original filename
+	      std::string orig = basename_from_path(target.files[fi].filePath);
+	      if (orig.empty()) {
+		std::ostringstream o; o << "content_" << (unsigned long long)target.contentId << "_file_" << fileId;
+		orig = o.str();
+	      }
+
+	      // derive relative directory from remote file path (e.g. "PRIVATE/M4ROOT/CLIP")
+	      std::string relDir = dirname_from_path(target.files[fi].filePath);
+
+	      // compute full local directory and ensure it exists
+	      std::string destDir = g_download_dir;
+	      if (!relDir.empty()) destDir = join_path(destDir, relDir);
+	      std::error_code ec;
+	      std::filesystem::create_directories(destDir, ec);
+
+	      // choose final filename (sync/boot: keep name & skip existing; else: uniquify)
+	      std::string finalName;
+	      std::string candidatePath = join_path(destDir, orig);
+	      if (is_sync) {
+		if (std::filesystem::exists(candidatePath)) {
+		  LOGI("[SKIP] already present: " << join_path(relDir, orig));
+		  dl_waiting = false;
+		  continue;
+		}
+		finalName = orig;
+	      } else {
+		finalName = unique_name(destDir, orig);
+	      }
+
+	      CrChar *saveDir = destDir.empty() ? nullptr
+		: const_cast<CrChar *>(reinterpret_cast<const CrChar *>(destDir.c_str()));
+	      if (g_stop.load(std::memory_order_relaxed)) { dl_waiting = false; break; }
+	      
+	      // progress label before SDK gives us the final path
+	      dl_current_label = join_path(relDir, finalName);
+	      dl_last_log_per = 101; // reset throttling so we log 0% immediately
+	      dl_last_log_tp = std::chrono::steady_clock::now();
+	      dl_start_tp = dl_last_log_tp;
+	      dl_any_progress = false;
+	      
+	      // kick off download
+	      SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(
+									 handle, slot, target.contentId, fileId, 0x1000000,
+									 saveDir, const_cast<CrChar *>(finalName.c_str()));
+
+	      {
+		std::unique_lock<std::mutex> lk(dl_mtx);
+		dl_cv.wait(lk, [&] { return !dl_waiting || g_stop.load(); });
+
+		if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+		  // We just finished a file; exit early.
+		  break;
+		}
+	      }
+
+	      if (g_stop.load(std::memory_order_relaxed)) break;
+	    }
+	  }
+	};
+
+	// -------- fetch & process --------
+	SDK::CrError resList = SDK::CrError_None;
+
+	if (sync_all) {
+	  // Walk ALL dates
+	  SDK::CrCaptureDate *dateList = nullptr; CrInt32u dateNums = 0;
+	  resList = SDK::GetRemoteTransferCapturedDateList(handle, slot, &dateList, &dateNums);
+	  if (resList != SDK::CrError_None || !dateList || dateNums == 0) {
+	    if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
+	    LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
 	    return;
 	  }
+
+	  // Process each date (newest-first is fine but not required when syncing *all*)
+	  auto newer = [](const SDK::CrCaptureDate& A, const SDK::CrCaptureDate& B){
+	    if (A.year != B.year) return A.year > B.year;
+	    if (A.month != B.month) return A.month > B.month;
+	    return A.day > B.day;
+	  };
+	  std::vector<SDK::CrCaptureDate> days(dateList, dateList + dateNums);
+	  std::sort(days.begin(), days.end(), newer);
+
+	  if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	    LOGI("Sync: stopped (slot " << (int)slot << ").");
+	    SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
+	    return;
+	  }
+	  
+	  for (auto const& day : days) {
+
+	    if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	      LOGI("Sync: stopped (slot " << (int)slot << ").");
+	      break;
+	    }
+	    
+	    if (g_stop.load(std::memory_order_relaxed)) break;
+	    SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0;
+	    resList = SDK::GetRemoteTransferContentsInfoList(handle, slot,
+							     SDK::CrGetContentsInfoListType_Range_Day, const_cast<SDK::CrCaptureDate*>(&day),
+							     0, &list, &count);
+	    if (resList == SDK::CrError_None && list && count > 0) {
+	      process_list(list, count, /*want_hint*/0);
+	    }
+	    if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
+	  }
+	  SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
+	} else {
+	  // EXISTING behavior: newest day & newest N items
 	  SDK::CrCaptureDate *dateList = nullptr; CrInt32u dateNums = 0;
 	  SDK::CrError derr = SDK::GetRemoteTransferCapturedDateList(handle, slot, &dateList, &dateNums);
 	  if (derr == SDK::CrError_None && dateList && dateNums > 0) {
@@ -447,129 +667,91 @@ public:
 		latest = D;
 	      }
 	    }
-	    resList = SDK::GetRemoteTransferContentsInfoList(handle, slot, SDK::CrGetContentsInfoListType_Range_Day, &latest, 0, &list, &count);
+	    SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0;
+	    resList = SDK::GetRemoteTransferContentsInfoList(handle, slot,
+							     SDK::CrGetContentsInfoListType_Range_Day, &latest, 0, &list, &count);
 	    SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    if (resList == SDK::CrError_None && list && count > 0) break;
-	    if (list) { SDK::ReleaseRemoteTransferContentsInfoList(handle, list); list = nullptr; count = 0; }
+	    if (resList != SDK::CrError_None || !list || count == 0) {
+	      if (list) { SDK::ReleaseRemoteTransferContentsInfoList(handle, list); }
+	      LOGI("[INFO] No contents found for latest day (slot=" << (int)slot << ")");
+	      return;
+	    }
+
+	    process_list(list, count, /*want_hint*/(addSize > 0 ? addSize : 1));
+	    SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
 	  } else {
 	    if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	  }
-	  std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
-	}
-	if (resList != SDK::CrError_None) {
-	  LOGE("[ERROR] Failed to get remote contents info list (err=0x" << std::hex << resList << std::dec << ")");
-	  if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
-	  return;
-	}
-	if (!list || count == 0) {
-	  LOGI("[INFO] No contents found for latest day (slot=" << (int)slot << ")");
-	  if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
-	  return;
-	}
-
-	// pick newest N = addSize (or 1)
-	CrInt32u want = (addSize > 0 ? addSize : 1);
-	std::vector<CrInt32u> idx(count);
-	for (CrInt32u i = 0; i < count; ++i) idx[i] = i;
-	std::sort(idx.begin(), idx.end(), [&](CrInt32u a, CrInt32u b) {
-	  const auto &A = list[a].modificationDatetimeUTC;
-	  const auto &B = list[b].modificationDatetimeUTC;
-	  if (A.year != B.year) return A.year > B.year;
-	  if (A.month != B.month) return A.month > B.month;
-	  if (A.day != B.day) return A.day > B.day;
-	  if (A.hour != B.hour) return A.hour > B.hour;
-	  if (A.minute != B.minute) return A.minute > B.minute;
-	  if (A.sec != B.sec) return A.sec > B.sec;
-	  return A.msec > B.msec;
-	});
-	if (want > idx.size()) want = static_cast<CrInt32u>(idx.size());
-	idx.resize(want);
-
-	for (CrInt32u k = 0; k < want; ++k) {
-	  if (g_stop.load(std::memory_order_relaxed)) break;
-	  const SDK::CrContentsInfo &target = list[idx[k]];
-	  if (target.contentId == 0) continue;
-
-	  for (CrInt32u fi = 0; fi < target.filesNum; ++fi) {
-	    if (g_stop.load(std::memory_order_relaxed)) break;
-	    dl_waiting = true;
-	    CrInt32u fileId = target.files[fi].fileId;
-
-	    // determine original filename
-	    std::string orig = basename_from_path(target.files[fi].filePath);
-	    if (orig.empty()) {
-	      std::ostringstream o; o << "content_" << (unsigned long long)target.contentId << "_file_" << fileId;
-	      orig = o.str();
-	    }
-
-	    // Boot-only behavior: skip if exists; otherwise keep original name.
-	    // Normal (post-boot) behavior: use unique_name() to add numeric suffixes.
-	    std::string targetPath = join_path(g_download_dir, orig);
-	    std::string finalName;
-	    if (is_boot) {
-	      if (std::filesystem::exists(targetPath)) {
-		LOGI("[SKIP] already present: " << orig);
-		dl_waiting = false;
-		continue;
-	      }
-	      finalName = orig;                         // keep original name during boot-pull
-	    } else {
-	      finalName = unique_name(g_download_dir, orig); // normal suffixing after boot
-	    }
-	    
-	    CrChar *saveDir = g_download_dir.empty() ? nullptr : const_cast<CrChar *>(reinterpret_cast<const CrChar *>(g_download_dir.c_str()));
-	    if (g_stop.load(std::memory_order_relaxed)) {
-	      dl_waiting = false;
-	      break;
-	    }
-	    SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(handle, slot, target.contentId, fileId, 0x1000000, saveDir, const_cast<CrChar *>(finalName.c_str()));
-	    if (dres != SDK::CrError_None) {
-	      LOGE( "[ERROR] GetRemoteTransferContentsDataFile failed (0x" << std::hex << dres << std::dec << ")" );
-	      dl_waiting = false;
-	      continue;
-	    }
-	    {
-	      std::unique_lock<std::mutex> lk(dl_mtx);
-	      dl_cv.wait(lk, [&] { return !dl_waiting || g_stop.load(); });
-	    }
-
-	    if (g_stop.load(std::memory_order_relaxed)) break;
-	    
-	    if (dl_notify_code == SDK::CrNotify_RemoteTransfer_Result_OK) {
-	      std::string saved = last_downloaded_file;
-	      std::string base = saved;
-	      size_t pos = base.find_last_of("/\\"); if (pos != std::string::npos) base = base.substr(pos + 1);
-	      long long sizeB = 0; struct stat st{}; if (::stat(saved.c_str(), &st) == 0) sizeB = (long long)st.st_size;
-	      LOGI( "[PHOTO] " << base << " (" << sizeB << " bytes)" );
-
-	      // Run post-download hook if provided
-	      if (!g_post_cmd.empty()) {
-		run_post_cmd(g_post_cmd, saved);
-	      }
-	    } else if (!g_stop.load()) {
-	      LOGE( "[ERROR] Download failed (notify=0x" << std::hex << dl_notify_code << std::dec << ")" );
-	    }
+	    LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
+	    return;
 	  }
 	}
-
-	SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
       });
     } catch (...) {
-      LOGE( "[ERROR] Failed to create download thread" );
+      LOGE("[ERROR] Failed to create download thread");
     }
+
   }
 
   void OnNotifyContentsTransfer(CrInt32u, SDK::CrContentHandle, CrChar *) override {}
 
-  void OnNotifyRemoteTransferResult(CrInt32u notify, CrInt32u per, CrChar *filename) override {
+  void OnNotifyRemoteTransferResult(CrInt32u notify, CrInt32u per, CrChar *filename) override
+  {
     std::unique_lock<std::mutex> lk(dl_mtx);
+
     if (filename) last_downloaded_file = filename; else last_downloaded_file.clear();
     dl_notify_code = notify; dl_progress = per;
-    if (notify != SDK::CrNotify_RemoteTransfer_InProgress) {
-      dl_waiting = false;
-      dl_cv.notify_all();
+
+    // Choose a human label: prefer filename from SDK, else the precomputed label.
+    std::string label = last_downloaded_file.empty() ? dl_current_label : last_downloaded_file;
+    // For nicer logs, strip to a relative path if possible (optional).
+    if (!label.empty()) {
+      // leave label as-is; it already is relative (relDir/finalName) in our pre-label
+    }
+
+    if (notify == SDK::CrNotify_RemoteTransfer_InProgress) {
+      // Throttle: log when +5% or +1s since last log (and always at 0%)
+      auto now = std::chrono::steady_clock::now();
+      bool time_ok = (dl_last_log_tp.time_since_epoch().count() == 0) ||
+	(now - dl_last_log_tp) >= std::chrono::seconds(1);
+      bool perc_ok = (dl_last_log_per == 101) || (per >= dl_last_log_per + 5);
+
+      if (time_ok || perc_ok) {
+	LOGI("[DL] " << (label.empty() ? "(unknown file)" : label) << " — " << per << "%");
+	dl_last_log_per = per;
+	dl_last_log_tp = now;
+	dl_any_progress = true;
+      }
+      // stay waiting; do NOT signal cv yet
+      return;
+    }
+
+    // Non-progress notifications: finish/abort/etc.
+    dl_waiting = false;
+    dl_cv.notify_all();
+
+    if (notify == SDK::CrNotify_RemoteTransfer_Result_OK) {
+      // No extra "100%" line; keep output compact.
+      std::string saved = last_downloaded_file;
+      std::string base = saved;
+      size_t pos = base.find_last_of("/\\"); if (pos != std::string::npos) base = base.substr(pos + 1);
+      long long sizeB = 0; struct stat st{}; if (::stat(saved.c_str(), &st) == 0) sizeB = (long long)st.st_size;
+
+      // Optional: include elapsed time (kept simple; remove if you prefer)
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+									      std::chrono::steady_clock::now() - dl_start_tp).count();
+
+      // For small files (no progress logs), this is the ONLY line.
+      LOGI("[PHOTO] " << base << " (" << sizeB << " bytes"
+	   << ", " << elapsed_ms << " ms)");
+
+      if (!g_post_cmd.empty() && !saved.empty()) run_post_cmd(g_post_cmd, saved);
+
+    } else {
+      LOGE("[DL] Failed: " << (label.empty() ? "(unknown file)" : label)
+	   << " (notify=0x" << std::hex << notify << std::dec << ")");
     }
   }
+
 
   void OnNotifyRemoteTransferResult(CrInt32u, CrInt32u, CrInt8u *, CrInt64u) override {}
   void OnNotifyFTPTransferResult(CrInt32u, CrInt32u, CrInt32u) override {}
@@ -583,85 +765,165 @@ private:
 
 // Attempt a single connect (by direct IP or enumeration). Returns true on success.
 static bool try_connect_once(const std::string &explicit_ip,
-			     const std::string &explicit_mac,
-			     const std::string &download_dir,
-			     bool verbose,
-			     QuietCallback &cb,
-			     SDK::CrDeviceHandle &handle,
-			     const SDK::ICrCameraObjectInfo *&selected,
-			     SDK::ICrEnumCameraObjectInfo *&enum_list,
-			     SDK::ICrCameraObjectInfo *&created) {
+                             const std::string &explicit_mac,
+                             const std::string &download_dir,
+                             bool verbose,
+                             const std::string &auth_user,
+                             const std::string &auth_pass,
+                             QuietCallback &cb,
+                             SDK::CrDeviceHandle &handle,
+                             const SDK::ICrCameraObjectInfo *&selected,
+                             SDK::ICrEnumCameraObjectInfo *&enum_list,
+                             SDK::ICrCameraObjectInfo *&created)
+{
   cb.verbose = verbose;
   SDK::CrError err = SDK::CrError_None;
   selected = nullptr; enum_list = nullptr; created = nullptr; handle = 0;
 
+  // -------- Discover or create camera object --------
   const bool using_direct_ip = !explicit_ip.empty();
   if (!using_direct_ip) {
-    LOGI( "Searching for cameras..." );
+    LOGI("Searching for cameras...");
     err = SDK::EnumCameraObjects(&enum_list, 1);
     if (err != SDK::CrError_None || !enum_list || enum_list->GetCount() == 0) {
-      LOGE( "No cameras found (EnumCameraObjects)" );
+      LOGE("No cameras found (EnumCameraObjects)");
       return false;
     }
     selected = enum_list->GetCameraObjectInfo(0);
-  }
-  else {
-    LOGI( "Connecting with camera at " << explicit_ip << "..." );
+  } else {
+    LOGI("Connecting with camera at " << explicit_ip << "...");
     CrInt32u ipAddr = ip_to_uint32(explicit_ip);
-    if (!ipAddr) {
-      LOGE( "Bad IP" ); return false;
-    }
-    unsigned char mac[6] = {0, 0, 0, 0, 0, 0};
+    if (!ipAddr) { LOGE("Bad IP"); return false; }
+
+    unsigned char mac[6] = {0,0,0,0,0,0};
     if (!explicit_mac.empty() && !parse_mac(explicit_mac, mac)) {
-      LOGE( "WARN bad MAC, ignoring: " << explicit_mac );
+      LOGE("WARN bad MAC, ignoring: " << explicit_mac);
     }
     SDK::CrCameraDeviceModelList model = SDK::CrCameraDeviceModel_ILCE_6700;
     err = SDK::CreateCameraObjectInfoEthernetConnection(&created, model, ipAddr, mac, 0);
     if (err != SDK::CrError_None || !created) {
-      LOGE( "CreateCameraObjectInfoEthernetConnection failed" );
+      LOGE("CreateCameraObjectInfoEthernetConnection failed");
       return false;
     }
     selected = created;
   }
 
-  // fingerprint
-  std::string fp_path = get_cache_dir() + "/fp_enumerated.bin";
-  std::vector<char> fp_buf; CrChar *fp_ptr = nullptr; CrInt32u fp_len = 0;
-  if (load_fingerprint(fp_path, fp_buf)) { fp_ptr = (CrChar *)fp_buf.data(); fp_len = (CrInt32u)fp_buf.size(); }
+  // -------- Credentials --------
+  const CrChar* user_ptr = auth_user.empty() ? nullptr : (const CrChar*)auth_user.c_str();
+  const CrChar* pass_ptr = auth_pass.empty() ? nullptr : (const CrChar*)auth_pass.c_str();
 
+  // -------- Fingerprint (cache) --------
+  std::string fp_path = get_cache_dir() + "/fp_enumerated.bin";
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(get_cache_dir(), ec);
+    if (ec) {
+      LOGE("[FP] failed to create cache dir: " << get_cache_dir() << " (" << ec.message() << ")");
+    }
+  }
+  std::vector<char> fp_cache;                // cached fp buffer
+  if (load_fingerprint(fp_path, fp_cache)) {
+    // ok if empty; we’ll decide below
+  }
+
+  // -------- Fingerprint (from discovered object) --------
+  // Per SDK sample, obtain a fingerprint from the *discovered* object and prefer it.
+  char fp_from_obj[512] = {0};
+  CrInt32u fp_from_obj_len = 0;
+  SDK::GetFingerprint(const_cast<SDK::ICrCameraObjectInfo *>(selected), fp_from_obj, &fp_from_obj_len);
+
+  const CrChar* fp_ptr = nullptr;
+  CrInt32u      fp_len = 0;
+  if (fp_from_obj_len > 0 && fp_from_obj_len <= sizeof(fp_from_obj)) {
+    fp_ptr = fp_from_obj;
+    fp_len = fp_from_obj_len;
+    LOGI("[FP] using fingerprint from discovered camera (" << fp_len << " bytes)");
+  } else if (!fp_cache.empty()) {
+    fp_ptr = (CrChar*)fp_cache.data();
+    fp_len = (CrInt32u)fp_cache.size();
+    LOGI("[FP] using cached fingerprint (" << fp_len << " bytes)");
+  } else {
+    LOGI("[FP] no fingerprint available for initial connect");
+  }
+
+  // -------- SSH/Access-Auth support & reconnecting flag --------
+  bool ssh_on = (selected && selected->GetSSHsupport() == SDK::CrSSHsupport_ON);
+  LOGI(std::string("[AUTH] Authenticating (ssh support is ") + (ssh_on ? "on" : "off") + ")");
+  if (user_ptr) LOGI("[AUTH] Using username to connect");
+
+  auto reconnecting = SDK::CrReconnecting_ON;
+  // If SSH is ON and we have no fingerprint yet, first handshake should not be "reconnecting".
+  if (ssh_on && fp_len == 0) {
+    reconnecting = SDK::CrReconnecting_OFF;
+  }
+
+  // -------- Connect --------
   err = SDK::Connect(const_cast<SDK::ICrCameraObjectInfo *>(selected), &cb, &handle,
-		     SDK::CrSdkControlMode_RemoteTransfer, SDK::CrReconnecting_ON,
-		     nullptr, nullptr, fp_ptr, fp_len);
-  if (err != SDK::CrError_None || !handle) {
-    LOGE( "Connect failed: 0x" << std::hex << err << std::dec );
+                     SDK::CrSdkControlMode_RemoteTransfer, reconnecting,
+                     const_cast<CrChar*>(user_ptr),
+                     const_cast<CrChar*>(pass_ptr),
+                     const_cast<CrChar*>(fp_ptr), fp_len);
+
+  // Handle 0x8213 (auth rejected / invalid params) explicitly
+  if (err != SDK::CrError_None && (unsigned)err == 0x8213) {
+    if (!ssh_on && (user_ptr || pass_ptr)) {
+      // Camera reports Access Auth OFF but creds were supplied → retry once without creds
+      LOGE("Connect failed 0x8213 with credentials; camera reports Access Auth OFF. Retrying once without credentials...");
+      err = SDK::Connect(const_cast<SDK::ICrCameraObjectInfo *>(selected), &cb, &handle,
+                         SDK::CrSdkControlMode_RemoteTransfer, SDK::CrReconnecting_ON,
+                         /*user*/nullptr, /*pass*/nullptr,
+                         const_cast<CrChar*>(fp_ptr), fp_len);
+    } else {
+      LOGE("Connect failed 0x8213; SSH/Access Auth is ON, so credentials (and possibly fingerprint) are required.");
+    }
+  }
+
+  if (err != SDK::CrError_None) {
+    unsigned u = (unsigned)err;
+    const char* name = crsdk_err::error_to_name(err);
+    
+    // Only log if we didn’t already explain above
+    if (u != 0x8213) {
+      LOGE("Connect failed: 0x" << std::hex << u << std::dec << " (" << name << ")");
+    }
     return false;
   }
 
-  // wait handshake
+  // -------- Wait for handshake completion --------
   {
     std::unique_lock<std::mutex> lk(cb.mtx);
-    cb.conn_cv.wait_for(lk, std::chrono::seconds(12), [&] { return cb.connected || cb.conn_finished || g_stop.load(); });
+    cb.conn_cv.wait_for(lk, std::chrono::seconds(12),
+                        [&] { return cb.connected || cb.conn_finished || g_stop.load(); });
   }
   if (!cb.connected) {
     std::ostringstream _m;
     _m << "Camera not available";
     if (cb.last_error_code) _m << " error=0x" << std::hex << cb.last_error_code << std::dec;
-    LOGE( _m.str() );
-    
+    LOGE(_m.str());
     return false;
   }
 
   cb.device_handle = handle;
-  LOGI( "Connected. Ctrl+C to stop." );
+  LOGI("Connected. Ctrl+C to stop.");
 
-  // persist fingerprint
+  // -------- Persist (updated) fingerprint for next run --------
   {
     char newfp[512] = {0}; CrInt32u nlen = 0;
     SDK::GetFingerprint(const_cast<SDK::ICrCameraObjectInfo *>(selected), newfp, &nlen);
-    if (nlen > 0 && nlen <= sizeof(newfp)) save_fingerprint(fp_path, newfp, nlen);
+    LOGI("[FP] GetFingerprint(ICrCameraObjectInfo*): " << nlen << " bytes");
+
+    if (nlen > 0 && nlen <= sizeof(newfp)) {
+      if (save_fingerprint(fp_path, newfp, nlen)) {
+        LOGI("[FP] saved " << nlen << " bytes to " << fp_path);
+      } else {
+        LOGE("[FP] failed to save fingerprint to " << fp_path);
+      }
+    } else {
+      LOGI("[FP] no fingerprint to save (nlen=0)");
+    }
   }
 
-  (void)download_dir; // already assigned to global outside
+  (void)download_dir; // already assigned globally elsewhere
   return true;
 }
 
@@ -675,7 +937,7 @@ static void disconnect_and_release(SDK::CrDeviceHandle &handle,
 
 // simple word list
 static const std::vector<std::string> commands = {
-  "shoot", "focus", "quit", "exit"
+  "shoot", "focus", "sync", "quit", "exit"
 };
 
 char* prompt(EditLine*) {
@@ -724,7 +986,7 @@ int main(int argc, char **argv) {
 
   std::string explicit_ip, explicit_mac, download_dir;
   bool verbose = false;
-  int boot_pull = 0;  // 0 = disabled
+  std::string auth_user, auth_pass;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -738,9 +1000,8 @@ int main(int argc, char **argv) {
       if (ms < 0) ms = 0;
       g_keepalive = std::chrono::milliseconds(ms);
     }
-    else if (a == "--boot-pull" && i + 1 < argc) {
-      boot_pull = std::max(0, std::atoi(argv[++i]));
-    }
+    else if (a == "--user" && i + 1 < argc) auth_user = argv[++i];
+    else if (a == "--pass" && i + 1 < argc) auth_pass = argv[++i];
   }
 
   if (!SDK::Init()) {
@@ -767,8 +1028,8 @@ int main(int argc, char **argv) {
     cb.last_error_code = 0;
     g_reconnect.store(false);
 
-    bool ok = try_connect_once(explicit_ip, explicit_mac, download_dir, verbose, cb,
-			       handle, selected, enum_list, created);
+    bool ok = try_connect_once(explicit_ip, explicit_mac, download_dir, verbose, auth_user, auth_pass,
+			       cb, handle, selected, enum_list, created);
     if (!ok) {
       disconnect_and_release(handle, created, enum_list);
       if (g_keepalive.count() == 0) {
@@ -796,37 +1057,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    // trigger the boot download after connect
-    // trigger the boot download after connect (non-blocking)
-    if (boot_pull > 0) {
-      // Snapshot how many download threads exist *before* we trigger boot-pull
-      const size_t start_threads = g_downloadThreads.size();
-
-      std::thread([&, start_threads, boot_pull]() {
-	LOGI("Boot-pull (async): latest " << boot_pull << " item(s) per slot (skip existing)...");
-	g_boot_pull_only_missing.store(true, std::memory_order_relaxed);
-
-	// Arm exactly two boot tokens for the two callback invocations
-	g_boot_tokens.store(2, std::memory_order_relaxed);
-	
-	// Kick off both slots (reuses the same code path as live notifications)
-	cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
-						     SDK::CrSlotNumber_Slot1, boot_pull);
-	cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
-						     SDK::CrSlotNumber_Slot2, boot_pull);
-
-	// Wait until all boot workers are done OR user pressed Ctrl-C
-	while (!g_stop.load(std::memory_order_relaxed) &&
-	       g_boot_active.load(std::memory_order_relaxed) > 0) {
-	  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	}
-
-	g_boot_pull_only_missing.store(false, std::memory_order_relaxed);
-	LOGI("Boot-pull (async): done.");
-      }).detach();
-    }
-
-    inputThread = std::thread([handle]() {
+    inputThread = std::thread([handle, &cb]() {
       
       unblock_sigint_in_this_thread();
       
@@ -842,7 +1073,7 @@ int main(int argc, char **argv) {
       el_set(el, EL_PROMPT, &prompt);
       el_set(el, EL_EDITOR, "emacs");  // or "vi"
       el_set(el, EL_HIST, history, hist);
-      el_set(el, EL_SIGNAL, 1); // let libedit cooperate with signals
+      el_set(el, EL_SIGNAL, 0); // our SIGINT handler controls shutdown
 
       // bind tab to our completion function
       el_set(el, EL_ADDFN, "my-complete", "Complete commands", &complete);
@@ -883,8 +1114,82 @@ int main(int argc, char **argv) {
 	  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 	  prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
 	  SDK::SetDeviceProperty(handle, &prop);
-	  LOGI( "Autofocus activated." );
+	  LOGI("Autofocus activated.");
+	  
+	  return 0;
+	}},
+	{"sync", [&](auto const& args)->int {
+	  // usage: sync [N | all | stop]  (default = 1)
+	  int n = 1;
+	  bool all = false;
+	  if (args.size() >= 2) {
+	    std::string a = args[1];
+	    std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c){ return std::tolower(c); });
+	    if (a == "all") {
+	      all = true;
+	    }
+	    else if (a == "stop") {
+	      g_sync_abort.store(true, std::memory_order_relaxed);
+	      g_sync_tokens.store(0, std::memory_order_relaxed); // disarm new sync workers
+	      LOGI("Sync: stopping (will finish current file and then stop).");
+	      return 0;
+	    }
+	    else {
+	      try { n = std::max(1, std::stoi(args[1])); }
+	      catch (...) { LOGE("usage: sync [count|all]"); return 2; }
+	    }
+	  }
+	  
+	  if (all) LOGI("Sync: ALL items from both slots (skip existing, keep names)...");
+	  else     LOGI("Sync: latest " << n << " item(s) per slot (skip existing, keep names)...");
 
+	  g_sync_abort.store(false, std::memory_order_relaxed);
+
+	  // Fire-and-forget worker so REPL stays responsive
+	  std::thread([&, all, n]{
+	    if (all) g_sync_all.store(true, std::memory_order_relaxed);
+
+	    // Arm tokens for exactly two callback invocations (slot1 + slot2)
+	    g_sync_tokens.store(2, std::memory_order_relaxed);
+
+	    // Reset active counter before we spawn the workers
+	    g_sync_active.store(0, std::memory_order_relaxed);
+
+	    // Kick both slots; same path as before
+	    cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
+							 SDK::CrSlotNumber_Slot1, all ? 0 : n);
+	    cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
+							 SDK::CrSlotNumber_Slot2, all ? 0 : n);
+
+	    // wait briefly until at least one worker has started (or an abort/stop)
+	    for (int i = 0; i < 40; ++i) { // ~1s total
+	      if (g_sync_active.load(std::memory_order_relaxed) > 0 ||
+		  g_sync_abort.load(std::memory_order_relaxed) ||
+		  g_stop.load(std::memory_order_relaxed)) {
+		break;
+	      }
+	      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	    }
+	    
+	    // Background wait (so prompt remains free)
+	    while (!g_stop.load(std::memory_order_relaxed) &&
+		   g_sync_active.load(std::memory_order_relaxed) > 0) {
+	      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	    }
+
+	    // Reset flag so future "sync N" behaves normally
+	    g_sync_all.store(false, std::memory_order_relaxed);
+
+	    // at the end of the detached sync thread
+	    if (g_sync_abort.load(std::memory_order_relaxed)) {
+	      LOGI("Sync: stopped.");
+	    } else {
+	      LOGI("Sync: done.");
+	    }
+	    
+	  }).detach();
+
+	  // Return immediately; user can keep typing/issuing commands
 	  return 0;
 	}},
 	{"quit", [&](auto const&)->int {
@@ -902,13 +1207,19 @@ int main(int argc, char **argv) {
         // Print logs that arrived just before we read; NO refresh here to avoid double prompt
         (void)drain_logs_and_refresh(nullptr);
 
+	// if stop was requested while draining logs, bail *before* libedit can redraw the prompt
+	if (g_stop.load(std::memory_order_relaxed)) break;
+
 	int count = 0;
 	errno = 0;
 	const char* s = el_gets(el, &count);
 
 	if (!s) {
 	  if (g_stop.load()) break;
-	  if (errno == EINTR) continue;
+	  if (errno == EINTR) {
+	    if (g_stop.load()) break;   // stop immediately after ^C
+	    continue;                   // only continue for non-stop EINTRs
+	  }
 	  if (feof(stdin)) { g_stop.store(true); break; }
 	  // Ctrl-D / EOF at empty prompt: el_gets() -> NULL, count==0, errno==0
 	  if (count == 0 && errno == 0) { g_stop.store(true); break; }
@@ -944,9 +1255,9 @@ int main(int argc, char **argv) {
 	}
 	int rc = it->second(args);
 	if (rc == 99) break;  // already set g_stop above
-
-	// print logs produced by the command, then repaint prompt
-	drain_logs_and_refresh(el);
+	
+	// Print logs produced by the command; let el_gets() render the next prompt once.
+	drain_logs_and_refresh(nullptr);
       }
 
       history_end(hist);
@@ -954,7 +1265,8 @@ int main(int argc, char **argv) {
 
       g_repl_active.store(false, std::memory_order_relaxed);
 
-      // makes sure the next shutdown line is printed on the next line, not next to the prompt
+      // makes sure the next shutdown line is printed on the next line
+      // instead of next to the prompt (looks nicer)
       LOGI("");
 
     });
@@ -964,18 +1276,24 @@ int main(int argc, char **argv) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    // 1) Stop the REPL first so it cannot redraw a prompt during shutdown.
+    if (inputThread.joinable()) {
+      // Nudge the REPL in case it’s waiting on poll(): send a wake byte.
+      if (g_wake_pipe[1] != -1) { char x = 0; (void)!write(g_wake_pipe[1], &x, 1); }
+      inputThread.join();
+    }
+    
+    // 2) Now log and disconnect the camera; no prompt can appear anymore.
     LOGI( "Shutting down connection..." );
     disconnect_and_release(handle, created, enum_list);
-
+    
+    // 3) Join any download workers.
     for (auto &t : g_downloadThreads) {
       if (t.joinable()) t.join();
     }
     g_downloadThreads.clear();
-
-    if (inputThread.joinable()) {
-      inputThread.join();
-    }
-
+    
+    // 4) Close wake pipe at the very end.
     if (g_wake_pipe[0] != -1) { close(g_wake_pipe[0]); g_wake_pipe[0] = -1; }
     if (g_wake_pipe[1] != -1) { close(g_wake_pipe[1]); g_wake_pipe[1] = -1; }
 
