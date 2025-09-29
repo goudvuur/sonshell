@@ -28,6 +28,7 @@
 #include <histedit.h>
 #include <functional>
 #include <deque>
+#include <arpa/inet.h>
 
 #include "CRSDK/CameraRemote_SDK.h"
 #include "CRSDK/ICrCameraObjectInfo.h"
@@ -779,7 +780,24 @@ static bool try_connect_once(const std::string &explicit_ip,
   cb.verbose = verbose;
   SDK::CrError err = SDK::CrError_None;
   selected = nullptr; enum_list = nullptr; created = nullptr; handle = 0;
-
+  
+  // Used by the direct-IP path and (maybe) a retry:
+  unsigned char direct_ip_mac[6] = {0,0,0,0,0,0};
+  SDK::CrCameraDeviceModelList direct_ip_model = SDK::CrCameraDeviceModel_ILCE_6700;
+  
+  // Parse explicit_ip ("x.y.z.w") into CrInt32u as required by the SDK
+  CrInt32u direct_ip_addr_num = 0;
+  if (!explicit_ip.empty()) {
+    struct in_addr ina{};
+    if (inet_pton(AF_INET, explicit_ip.c_str(), &ina) == 1) {
+      // Keep network byte order (big-endian) as CrInt32u
+      direct_ip_addr_num = static_cast<CrInt32u>(ina.s_addr);
+    } else {
+      LOGE("Invalid IPv4 address: " << explicit_ip);
+      return false;
+    }
+  }
+  
   // -------- Discover or create camera object --------
   const bool using_direct_ip = !explicit_ip.empty();
   if (!using_direct_ip) {
@@ -791,16 +809,18 @@ static bool try_connect_once(const std::string &explicit_ip,
     }
     selected = enum_list->GetCameraObjectInfo(0);
   } else {
-    LOGI("Connecting with camera at " << explicit_ip << "...");
-    CrInt32u ipAddr = ip_to_uint32(explicit_ip);
-    if (!ipAddr) { LOGE("Bad IP"); return false; }
-
-    unsigned char mac[6] = {0,0,0,0,0,0};
-    if (!explicit_mac.empty() && !parse_mac(explicit_mac, mac)) {
+    // --- Direct IP path ---
+    if (!explicit_mac.empty() && !parse_mac(explicit_mac, direct_ip_mac)) {
       LOGE("WARN bad MAC, ignoring: " << explicit_mac);
     }
-    SDK::CrCameraDeviceModelList model = SDK::CrCameraDeviceModel_ILCE_6700;
-    err = SDK::CreateCameraObjectInfoEthernetConnection(&created, model, ipAddr, mac, 0);
+    
+    // If the user provided credentials, default to SSH ON for first attempt.
+    CrInt32u sshSupportFlag = (!auth_user.empty() || !auth_pass.empty())
+      ? SDK::CrSSHsupport_ON
+      : SDK::CrSSHsupport_OFF;
+
+    // Initial direct-IP object
+    err = SDK::CreateCameraObjectInfoEthernetConnection(&created, direct_ip_model, direct_ip_addr_num, direct_ip_mac, sshSupportFlag);
     if (err != SDK::CrError_None || !created) {
       LOGE("CreateCameraObjectInfoEthernetConnection failed");
       return false;
@@ -851,30 +871,52 @@ static bool try_connect_once(const std::string &explicit_ip,
   LOGI(std::string("[AUTH] Authenticating (ssh support is ") + (ssh_on ? "on" : "off") + ")");
   if (user_ptr) LOGI("[AUTH] Using username to connect");
 
+  bool is_direct_ip = (created != nullptr);
+  
   auto reconnecting = SDK::CrReconnecting_ON;
-  // If SSH is ON and we have no fingerprint yet, first handshake should not be "reconnecting".
+  // First contact over direct IP should not be "reconnecting".
+  if (is_direct_ip) {
+    reconnecting = SDK::CrReconnecting_OFF;
+  }
+  // Also, if SSH is ON and there's no fingerprint, force a full handshake.
   if (ssh_on && fp_len == 0) {
     reconnecting = SDK::CrReconnecting_OFF;
   }
-
+  
   // -------- Connect --------
   err = SDK::Connect(const_cast<SDK::ICrCameraObjectInfo *>(selected), &cb, &handle,
                      SDK::CrSdkControlMode_RemoteTransfer, reconnecting,
                      const_cast<CrChar*>(user_ptr),
                      const_cast<CrChar*>(pass_ptr),
                      const_cast<CrChar*>(fp_ptr), fp_len);
+  
+  if (err != SDK::CrError_None && is_direct_ip && (unsigned)err == 0x8202) {
+    // Transport refused the path we chose. Retry once with the opposite SSH flag.
+    LOGE("Connect failed 0x8202; retrying once with opposite SSH support flag...");
+    
+    // Recreate the IP object with flipped SSH support.
+    CrInt32u flipped = (selected->GetSSHsupport() == SDK::CrSSHsupport_ON)
+      ? SDK::CrSSHsupport_OFF : SDK::CrSSHsupport_ON;
 
-  // Handle 0x8213 (auth rejected / invalid params) explicitly
-  if (err != SDK::CrError_None && (unsigned)err == 0x8213) {
-    if (!ssh_on && (user_ptr || pass_ptr)) {
-      // Camera reports Access Auth OFF but creds were supplied → retry once without creds
-      LOGE("Connect failed 0x8213 with credentials; camera reports Access Auth OFF. Retrying once without credentials...");
-      err = SDK::Connect(const_cast<SDK::ICrCameraObjectInfo *>(selected), &cb, &handle,
-                         SDK::CrSdkControlMode_RemoteTransfer, SDK::CrReconnecting_ON,
-                         /*user*/nullptr, /*pass*/nullptr,
-                         const_cast<CrChar*>(fp_ptr), fp_len);
-    } else {
-      LOGE("Connect failed 0x8213; SSH/Access Auth is ON, so credentials (and possibly fingerprint) are required.");
+    SDK::ICrCameraObjectInfo* retry_obj = nullptr;
+    SDK::CreateCameraObjectInfoEthernetConnection(&retry_obj, direct_ip_model, direct_ip_addr_num, direct_ip_mac, flipped);
+    if (retry_obj) {
+      // Keep first-contact semantics: not reconnecting.
+      auto retry_reconnecting = SDK::CrReconnecting_OFF;
+      
+      err = SDK::Connect(retry_obj, &cb, &handle,
+			 SDK::CrSdkControlMode_RemoteTransfer, retry_reconnecting,
+			 const_cast<CrChar*>(user_ptr),
+			 const_cast<CrChar*>(pass_ptr),
+			 const_cast<CrChar*>(fp_ptr), fp_len);
+      
+      if (err == SDK::CrError_None) {
+	// Use the successful object as the selected one going forward
+	if (created) { created->Release(); created = nullptr; }
+	selected = retry_obj;
+      } else {
+	retry_obj->Release();
+      }
     }
   }
 
@@ -1028,8 +1070,8 @@ int main(int argc, char **argv) {
     cb.last_error_code = 0;
     g_reconnect.store(false);
 
-    bool ok = try_connect_once(explicit_ip, explicit_mac, download_dir, verbose, auth_user, auth_pass,
-			       cb, handle, selected, enum_list, created);
+    bool ok = try_connect_once(explicit_ip, explicit_mac, download_dir, verbose, auth_user, auth_pass, cb, handle, selected, enum_list, created);
+    
     if (!ok) {
       disconnect_and_release(handle, created, enum_list);
       if (g_keepalive.count() == 0) {
