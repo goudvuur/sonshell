@@ -1065,6 +1065,13 @@ int main(int argc, char **argv) {
       History* hist = history_init();
       HistEvent ev{};
       history(hist, &ev, H_SETSIZE, 1000);
+      // Pick a history file path
+      std::filesystem::create_directories(get_cache_dir());
+      const std::string histfile = join_path(get_cache_dir(), "history");
+      // Load previous session history (ignore failure if file doesn't exist yet)
+      history(hist, &ev, H_LOAD, histfile.c_str());
+      // Optional niceties
+      history(hist, &ev, H_SETUNIQUE, 1);   // no duplicate consecutive entries
 
       // line editor setup
       EditLine* el = el_init("sonshell", stdin, stdout, stderr);
@@ -1260,6 +1267,8 @@ int main(int argc, char **argv) {
 	drain_logs_and_refresh(nullptr);
       }
 
+      // save historry
+      history(hist, &ev, H_SAVE, histfile.c_str());
       history_end(hist);
       el_end(el);
 
