@@ -65,6 +65,7 @@ static std::atomic<int>  g_sync_tokens{0};   // how many callbacks are marked as
 static std::atomic<int>  g_sync_active{0};   // how many boot-spawned workers are still running
 static std::atomic<bool> g_sync_all{false};
 static std::atomic<bool> g_sync_abort{false};
+static std::atomic<bool> g_sync_running{false};
 
 static std::mutex        g_monitor_mtx;
 static std::thread       g_monitor_thread;
@@ -822,7 +823,7 @@ public:
 	auto process_list = [&](SDK::CrContentsInfo *list, CrInt32u count, CrInt32u want_hint) {
 	  if (!list || count == 0) return;
 
-	  if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	  if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
 	    if (verbose) LOGI("Sync: stopped (slot " << (int)slot << ").");
 	    return; // bail out before planning/logging
 	  }
@@ -857,7 +858,7 @@ public:
 
 	  for (CrInt32u k = 0; k < idx.size(); ++k) {
 
-	    if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	    if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
 	      dl_waiting = false;             // nothing in-flight yet for this file
 	      break;
 	    }
@@ -868,7 +869,7 @@ public:
 
 	    for (CrInt32u fi = 0; fi < target.filesNum; ++fi) {
 
-	      if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	      if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
 		dl_waiting = false;             // nothing in-flight yet for this file
 		break;
 	      }
@@ -927,10 +928,10 @@ public:
 		std::unique_lock<std::mutex> lk(dl_mtx);
 		dl_cv.wait(lk, [&] { return !dl_waiting || g_stop.load(); });
 
-		if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
-		  // We just finished a file; exit early.
-		  break;
-		}
+	if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
+	  // We just finished a file; exit early.
+	  break;
+	}
 	      }
 
 	      if (g_stop.load(std::memory_order_relaxed)) break;
@@ -960,7 +961,7 @@ public:
 	  std::vector<SDK::CrCaptureDate> days(dateList, dateList + dateNums);
 	  std::sort(days.begin(), days.end(), newer);
 
-	  if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	  if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
 	    LOGI("Sync: stopped (slot " << (int)slot << ").");
 	    SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
 	    return;
@@ -968,7 +969,7 @@ public:
 	  
 	  for (auto const& day : days) {
 
-	    if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
+	    if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
 	      LOGI("Sync: stopped (slot " << (int)slot << ").");
 	      break;
 	    }
@@ -1033,6 +1034,8 @@ public:
     if (filename) last_downloaded_file = filename; else last_downloaded_file.clear();
     dl_notify_code = notify; dl_progress = per;
 
+    bool sync_aborted = g_sync_abort.load(std::memory_order_acquire);
+
     // Choose a human label: prefer filename from SDK, else the precomputed label.
     std::string label = last_downloaded_file.empty() ? dl_current_label : last_downloaded_file;
     // For nicer logs, strip to a relative path if possible (optional).
@@ -1041,6 +1044,10 @@ public:
     }
 
     if (notify == SDK::CrNotify_RemoteTransfer_InProgress) {
+      if (sync_aborted) {
+        // Suppress noise while waiting for the device to acknowledge cancellation.
+        return;
+      }
       // Throttle: log when +5% or +1s since last log (and always at 0%)
       auto now = std::chrono::steady_clock::now();
       bool time_ok = (dl_last_log_tp.time_since_epoch().count() == 0) ||
@@ -1060,6 +1067,17 @@ public:
     // Non-progress notifications: finish/abort/etc.
     dl_waiting = false;
     dl_cv.notify_all();
+
+    if (sync_aborted) {
+      if (notify == SDK::CrNotify_RemoteTransfer_Result_OK) {
+        LOGI("[DL] Completed before cancel request took effect: "
+             << (label.empty() ? "(unknown file)" : label));
+      } else {
+        LOGI("[DL] Canceled: " << (label.empty() ? "(unknown file)" : label)
+             << " (notify=0x" << std::hex << notify << std::dec << ")");
+      }
+      return;
+    }
 
     if (notify == SDK::CrNotify_RemoteTransfer_Result_OK) {
       // No extra "100%" line; keep output compact.
@@ -1573,9 +1591,48 @@ int main(int argc, char **argv) {
 	      all = true;
 	    }
 	    else if (a == "stop") {
-	      g_sync_abort.store(true, std::memory_order_relaxed);
-	      g_sync_tokens.store(0, std::memory_order_relaxed); // disarm new sync workers
-	      LOGI("Sync: stopping (will finish current file and then stop).");
+	      if (!g_sync_running.load(std::memory_order_acquire)) {
+	        LOGI("Sync: nothing to stop.");
+	        return 0;
+	      }
+	      g_sync_abort.store(true, std::memory_order_release);
+	      g_sync_tokens.store(0, std::memory_order_release); // disarm new sync workers
+
+	      bool cancel_sent = false;
+	      if (handle) {
+	        auto cancel_err = SDK::SendCommand(handle,
+	                                           SDK::CrCommandId::CrCommandId_CancelContentsTransfer,
+	                                           SDK::CrCommandParam_Down);
+	        if (cancel_err == SDK::CrError_None) {
+	          // Mirror other button-like commands by issuing an "up" event too.
+	          (void)SDK::SendCommand(handle,
+	                                 SDK::CrCommandId::CrCommandId_CancelContentsTransfer,
+	                                 SDK::CrCommandParam_Up);
+	          cancel_sent = true;
+	        } else if (cancel_err == SDK::CrError_Api_Insufficient ||
+	                   cancel_err == SDK::CrError_Generic_NotSupported ||
+	                   cancel_err == SDK::CrError_Genric_NotSupported ||
+	                   cancel_err == SDK::CrError_Connect_ContentsTransfer_NotSupported) {
+	          LOGI("Sync: camera does not support immediate cancel (" << crsdk_err::error_to_name(cancel_err)
+	               << "); finishing current file.");
+	        } else {
+	          unsigned code = static_cast<unsigned>(cancel_err);
+	          LOGW("Sync: cancel command failed: " << crsdk_err::error_to_name(cancel_err)
+	               << " (0x" << std::hex << code << std::dec << ")");
+	        }
+	      }
+
+	      {
+	        std::lock_guard<std::mutex> lk(cb.dl_mtx);
+	        cb.dl_waiting = false;
+	      }
+	      cb.dl_cv.notify_all();
+
+	      if (cancel_sent) {
+	        LOGI("Sync: stopping (cancel requested; waiting for workers to exit).");
+	      } else {
+	        LOGI("Sync: stopping (will finish current file and then stop).");
+	      }
 	      return 0;
 	    }
 	    else {
@@ -1584,13 +1641,25 @@ int main(int argc, char **argv) {
 	    }
 	  }
 	  
+	  bool expected_running = false;
+	  if (!g_sync_running.compare_exchange_strong(expected_running, true,
+	                                             std::memory_order_acq_rel)) {
+	    LOGW("Sync already in progress. Use `sync stop` to cancel.");
+	    return 0;
+	  }
+
 	  if (all) LOGI("Sync: ALL items from both slots (skip existing, keep names)...");
 	  else     LOGI("Sync: latest " << n << " item(s) per slot (skip existing, keep names)...");
 
-	  g_sync_abort.store(false, std::memory_order_relaxed);
+	  g_sync_abort.store(false, std::memory_order_release);
 
 	  // Fire-and-forget worker so REPL stays responsive
-	  std::thread([&, all, n]{
+	  try {
+	    std::thread([&, all, n]{
+	      struct SyncRunningReset {
+		~SyncRunningReset() { g_sync_running.store(false, std::memory_order_release); }
+	      } _sync_reset_guard;
+
 	    if (all) g_sync_all.store(true, std::memory_order_relaxed);
 
 	    // Arm tokens for exactly two callback invocations (slot1 + slot2)
@@ -1608,7 +1677,7 @@ int main(int argc, char **argv) {
 	    // wait briefly until at least one worker has started (or an abort/stop)
 	    for (int i = 0; i < 40; ++i) { // ~1s total
 	      if (g_sync_active.load(std::memory_order_relaxed) > 0 ||
-		  g_sync_abort.load(std::memory_order_relaxed) ||
+	  	g_sync_abort.load(std::memory_order_acquire) ||
 		  g_stop.load(std::memory_order_relaxed)) {
 		break;
 	      }
@@ -1625,13 +1694,18 @@ int main(int argc, char **argv) {
 	    g_sync_all.store(false, std::memory_order_relaxed);
 
 	    // at the end of the detached sync thread
-	    if (g_sync_abort.load(std::memory_order_relaxed)) {
+	    if (g_sync_abort.load(std::memory_order_acquire)) {
 	      LOGI("Sync: stopped.");
 	    } else {
 	      LOGI("Sync: done.");
 	    }
 	    
 	  }).detach();
+	  } catch (...) {
+	    g_sync_running.store(false, std::memory_order_release);
+	    LOGE("Sync: failed to launch worker thread");
+	    return 2;
+	  }
 
 	  // Return immediately; user can keep typing/issuing commands
 	  return 0;
