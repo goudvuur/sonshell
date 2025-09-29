@@ -45,7 +45,7 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 | Command | Description |
 | --- | --- |
 | `shoot` | Fire the shutter (full press). |
-| `trigger` | Alias for `shoot`. |
+| `trigger` | Alias for `shoot`. (also bound to **F1** in the REPL) |
 | `focus` | Half-press the shutter to autofocus, then release. |
 | `sync <N>` | Download the most recent `N` items from each slot (skips existing files). |
 | `sync all` | Mirror every item from both slots to the download directory. |
@@ -55,7 +55,7 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 | `poweroff` | Send the camera a power-off command. |
 | `quit`, `exit` | Leave the shell and terminate the program. |
 
-Additional shortcuts: press **ESC/Q** while the monitor window is focused to stop live-view, and use **Ctrl+C** or **Ctrl+D** at the prompt to exit cleanly.
+Additional shortcuts: press **ESC/Q** while the monitor window is focused to stop live-view, press **ESC** at the prompt to quit the shell, and use **Ctrl+C** or **Ctrl+D** to exit cleanly as well.
 
 
 ## Examples

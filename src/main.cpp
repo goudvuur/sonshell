@@ -95,6 +95,11 @@ static void monitor_join_stale_thread() {
   }
 }
 
+static unsigned char repl_trigger_shoot(EditLine* el, int) {
+  el_push(el, "shoot\n");
+  return CC_REFRESH;
+}
+
 // ----------------------------
 // Logging
 // ----------------------------
@@ -489,6 +494,30 @@ static int my_getc(EditLine* el, char* c) {
 	  std::fputs("\n", stdout);  // drop the current line cleanly
 	  std::fflush(stdout);
 	  return 0; // el_gets() sees EOF and exits immediately
+	}
+	if (*c == 27) { // ESC pressed at prompt -> exit shell (unless part of escape sequence)
+	  bool escape_alone = true;
+	  struct pollfd esc_fd{STDIN_FILENO, POLLIN, 0};
+	  while (true) {
+	    int pr = poll(&esc_fd, 1, 30);
+	    if (pr < 0) {
+	      if (errno == EINTR) continue;
+	      break; // treat as lone ESC on error
+	    }
+	    if (pr == 0) {
+	      break; // no extra byte -> lone ESC
+	    }
+	    if (esc_fd.revents & POLLIN) {
+	      escape_alone = false;
+	    }
+	    break;
+	  }
+	  if (escape_alone) {
+	    g_stop.store(true, std::memory_order_relaxed);
+	    std::fputs("\n", stdout);
+	    std::fflush(stdout);
+	    return 0;
+	  }
 	}
 	return 1;
       }
@@ -1437,6 +1466,11 @@ int main(int argc, char **argv) {
       // bind tab to our completion function
       el_set(el, EL_ADDFN, "my-complete", "Complete commands", &complete);
       el_set(el, EL_BIND, "\t", "my-complete", NULL);
+
+      el_set(el, EL_ADDFN, "trigger-shoot", "Trigger shutter release", &repl_trigger_shoot);
+      el_set(el, EL_BIND, "\eOP", "trigger-shoot", NULL);    // xterm/VT100 F1
+      el_set(el, EL_BIND, "\e[11~", "trigger-shoot", NULL);  // linux console F1
+      el_set(el, EL_BIND, "\e[[A", "trigger-shoot", NULL);   // some terminals F1
 
       g_repl_active.store(true, std::memory_order_relaxed);
 
