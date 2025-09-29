@@ -71,7 +71,7 @@ See [INSTALL.md](./INSTALL.md)
 
 ---
 
-## How It Works (short version)
+## How It Works
 1. **Connect** to the camera (via IP or enumeration).
    Stores/reuses SDK **fingerprint** under `~/.cache/sonshell/`.
 2. **Wait for notifications**: when the camera signals new contents,
@@ -80,6 +80,12 @@ See [INSTALL.md](./INSTALL.md)
    Safe naming ensures no overwrite (`file_1.jpg`, etc.).
 4. **Hook**: if `--cmd` is set, fork/exec the script with the saved path.
 5. **Reconnect** on errors/disconnects if `--keepalive` is set.
+
+---
+
+## Tested cameras
+
+- Sony α6700 (body firmware v2.00)
 
 ---
 
