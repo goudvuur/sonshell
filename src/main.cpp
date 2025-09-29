@@ -72,6 +72,29 @@ static std::atomic<bool> g_monitor_running{false};
 static std::atomic<bool> g_monitor_stop_flag{false};
 static constexpr const char* kMonitorWindowName = "sonshell-monitor";
 
+static bool monitor_window_is_alive() {
+  try {
+    double visible = cv::getWindowProperty(kMonitorWindowName, cv::WND_PROP_VISIBLE);
+    double autosize = cv::getWindowProperty(kMonitorWindowName, cv::WND_PROP_AUTOSIZE);
+    return visible > 0.0 || autosize > 0.0;
+  } catch (const cv::Exception&) {
+    return false;
+  }
+}
+
+static void monitor_join_stale_thread() {
+  std::thread stale;
+  {
+    std::lock_guard<std::mutex> lk(g_monitor_mtx);
+    if (g_monitor_running.load(std::memory_order_acquire)) return;
+    if (!g_monitor_thread.joinable()) return;
+    stale = std::move(g_monitor_thread);
+  }
+  if (stale.joinable()) {
+    stale.join();
+  }
+}
+
 // ----------------------------
 // Logging
 // ----------------------------
@@ -228,8 +251,19 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
   std::vector<CrInt8u> buffer;
   CrInt32u last_buf_capacity = 0;
 
+  bool window_visible_once = false;
+  bool frame_displayed_once = false;
+
   while (!g_monitor_stop_flag.load(std::memory_order_acquire) &&
          !g_stop.load(std::memory_order_acquire)) {
+
+    if (window_created && window_visible_once) {
+      if (!monitor_window_is_alive()) {
+        LOGI("[monitor] window closed; stopping live view");
+        g_monitor_stop_flag.store(true, std::memory_order_release);
+        break;
+      }
+    }
 
     if (!handle) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -273,8 +307,14 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
       continue;
     }
     if (lv_res != SDK::CrError_None) {
-      LOGE("[monitor] Live view fetch failed: " << crsdk_err::error_to_name(lv_res)
-            << " (0x" << std::hex << static_cast<unsigned>(lv_res) << std::dec << ")");
+      if (lv_res == SDK::CrError_Generic && !frame_displayed_once) {
+        if (verbose) {
+          LOGD("[monitor] Live view fetch returned generic error before first frame; retrying");
+        }
+      } else {
+        LOGE("[monitor] Live view fetch failed: " << crsdk_err::error_to_name(lv_res)
+              << " (0x" << std::hex << static_cast<unsigned>(lv_res) << std::dec << ")");
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       continue;
     }
@@ -302,6 +342,8 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
 
     try {
       cv::imshow(kMonitorWindowName, frame);
+      window_visible_once = true;
+      frame_displayed_once = true;
     } catch (const cv::Exception& ex) {
       LOGE("[monitor] imshow error: " << ex.what());
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -313,9 +355,10 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
       g_monitor_stop_flag.store(true, std::memory_order_release);
       break;
     }
+
   }
 
-  if (window_created) {
+  if (window_created && monitor_window_is_alive()) {
     try {
       cv::destroyWindow(kMonitorWindowName);
     } catch (const cv::Exception& ex) {
@@ -329,6 +372,8 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
 }
 
 static bool monitor_start(SDK::CrDeviceHandle handle, bool verbose) {
+  monitor_join_stale_thread();
+
   if (!handle) {
     LOGE("Camera handle not available; cannot start monitor.");
     return false;
@@ -379,10 +424,12 @@ static void monitor_stop() {
       return;
     }
     g_monitor_stop_flag.store(true, std::memory_order_release);
-    try {
-      cv::destroyWindow(kMonitorWindowName);
-    } catch (const cv::Exception& ex) {
-      LOGE("[monitor] destroyWindow error: " << ex.what());
+    if (monitor_window_is_alive()) {
+      try {
+        cv::destroyWindow(kMonitorWindowName);
+      } catch (const cv::Exception& ex) {
+        LOGE("[monitor] destroyWindow error: " << ex.what());
+      }
     }
     local = std::move(g_monitor_thread);
   }

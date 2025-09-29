@@ -40,15 +40,22 @@ https://github.com/user-attachments/assets/6146ff3b-d51c-412b-8684-bdde5c418d4d
 
 ## Interactive Commands
 
-Once connected, you enter the interactive **SonShell** prompt:
+Once connected you drop into the **SonShell** prompt. Every command below is available at the REPL:
 
-- `shoot` : Trigger shutter release.
-- `focus` : Trigger autofocus (half-press behavior).
-- `quit` or `exit` : Leave the shell and stop the program.
-- `sync <N>` : Download the last N files per slot (skips existing files).
-- `sync all` : Download *all* files, preserving camera folder structure.
-- `sync stop` : Abort an ongoing sync session (after the current file).
-- Ctrl-C / Ctrl-D exit cleanly.
+| Command | Description |
+| --- | --- |
+| `shoot` | Fire the shutter (full press). |
+| `trigger` | Alias for `shoot`. |
+| `focus` | Half-press the shutter to autofocus, then release. |
+| `sync <N>` | Download the most recent `N` items from each slot (skips existing files). |
+| `sync all` | Mirror every item from both slots to the download directory. |
+| `sync stop` | Gracefully cancel an in-progress sync after the current file finishes. |
+| `monitor start` | Launch the live-view window; closes automatically when you close the window or run `monitor stop`. |
+| `monitor stop` | Stop live-view streaming and close the OpenCV window. |
+| `poweroff` | Send the camera a power-off command. |
+| `quit`, `exit` | Leave the shell and terminate the program. |
+
+Additional shortcuts: press **ESC/Q** while the monitor window is focused to stop live-view, and use **Ctrl+C** or **Ctrl+D** at the prompt to exit cleanly.
 
 
 ## Examples
