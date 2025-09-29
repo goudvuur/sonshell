@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/6146ff3b-d51c-412b-8684-bdde5c418d4d
 - Saves into a chosen directory with **unique filenames**.
 - **Post-download hook**: run any executable/script with the saved file path as argument.
 - **Keepalive mode**: auto-retry on startup failure or after disconnects.
-- Linux-only code.
+- Linux-only
 
 ---
 
