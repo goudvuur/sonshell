@@ -44,8 +44,8 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 
 | Command | Description |
 | --- | --- |
-| `shoot` | Fire the shutter (full press). |
-| `trigger` | Alias for `shoot`. (also bound to **F1** in the REPL) |
+| `shoot` | Fire the shutter (full press). Shortcut: **F1**. |
+| `trigger` | Alias for `shoot`. Shortcut: **F1**. |
 | `focus` | Half-press the shutter to autofocus, then release. |
 | `sync <N>` | Download the most recent `N` items from each slot (skips existing files). |
 | `sync all` | Mirror every item from both slots to the download directory. |
@@ -53,7 +53,7 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 | `monitor start` | Launch the live-view window; closes automatically when you close the window or run `monitor stop`. |
 | `monitor stop` | Stop live-view streaming and close the OpenCV window. |
 | `poweroff` | Send the camera a power-off command. |
-| `quit`, `exit` | Leave the shell and terminate the program. |
+| `quit`, `exit` | Leave the shell and terminate the program. Shortcut: **ESC**. |
 
 Additional shortcuts: press **ESC/Q** while the monitor window is focused to stop live-view, press **ESC** at the prompt to quit the shell, and use **Ctrl+C** or **Ctrl+D** to exit cleanly as well.
 
