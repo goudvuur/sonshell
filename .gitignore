@@ -3,6 +3,13 @@ build/
 build-*/
 cmake-build-*/
 
+# Emacs backup files
+*~
+\#*\#
+
+# Emacs auto-save files
+.#*
+
 # CMake generated files
 CMakeCache.txt
 CMakeFiles/
@@ -51,3 +58,12 @@ rules.ninja
 # OS-specific
 .DS_Store
 Thumbs.db
+# Helper binaries and scratch tools
+/tools/
+!/tools/gen_error_names.py
+!/tools/gen_prop_names.py
+
+# Extracted SDK documentation/assets (keep zip only)
+/docs/
+!/docs/CrSDK_v2.00.00_api.zip
+!/docs/CrSDK_v2.00.00_app.zip

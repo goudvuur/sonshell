@@ -11,6 +11,7 @@
 #include <atomic>
 #include <csignal>
 #include <chrono>
+#include <new>
 #include <sys/stat.h>
 #include <thread>
 #include <iomanip>
@@ -29,12 +30,17 @@
 #include <functional>
 #include <deque>
 #include <arpa/inet.h>
+#include <clocale>
 
 #include "CRSDK/CameraRemote_SDK.h"
 #include "CRSDK/ICrCameraObjectInfo.h"
 #include "CRSDK/IDeviceCallback.h"
 #include "CRSDK/CrDeviceProperty.h"
 #include "CRSDK/CrTypes.h"
+#include "CRSDK/CrImageDataBlock.h"
+#include "CRSDK/CrDefines.h"
+
+#include <opencv2/opencv.hpp>
 
 #include "prop_names_generated.h"
 #include "error_names_generated.h"
@@ -60,6 +66,12 @@ static std::atomic<int>  g_sync_active{0};   // how many boot-spawned workers ar
 static std::atomic<bool> g_sync_all{false};
 static std::atomic<bool> g_sync_abort{false};
 
+static std::mutex        g_monitor_mtx;
+static std::thread       g_monitor_thread;
+static std::atomic<bool> g_monitor_running{false};
+static std::atomic<bool> g_monitor_stop_flag{false};
+static constexpr const char* kMonitorWindowName = "sonshell-monitor";
+
 // ----------------------------
 // Logging
 // ----------------------------
@@ -69,6 +81,49 @@ struct LogItem {
   LogLevel level;
   std::string text;
 };
+static bool g_stdout_is_tty = isatty(STDOUT_FILENO);
+static bool g_stderr_is_tty = isatty(STDERR_FILENO);
+
+static const char* log_color(LogLevel lvl) {
+  switch (lvl) {
+    case LogLevel::Info:  return "\033[36m";  // cyan
+    case LogLevel::Warn:  return "\033[33m";  // yellow
+    case LogLevel::Error: return "\033[31m";  // red
+    case LogLevel::Debug: return "\033[90m";  // dim gray
+  }
+  return "\033[0m";
+}
+
+static const char* log_label(LogLevel lvl) {
+  switch (lvl) {
+    case LogLevel::Info:  return "INFO";
+    case LogLevel::Warn:  return "WARN";
+    case LogLevel::Error: return "ERROR";
+    case LogLevel::Debug: return "DEBUG";
+  }
+  return "LOG";
+}
+
+static inline bool use_color_for(std::ostream& os) {
+  return (&os == &std::cerr) ? g_stderr_is_tty : g_stdout_is_tty;
+}
+
+static inline void write_log_line(LogLevel lvl, const std::string& text, std::ostream& os) {
+  if (text.empty()) return;
+
+  std::string content = text;
+  if (content.empty() || content.front() != '[') {
+    content = std::string("[") + log_label(lvl) + "] " + content;
+  }
+
+  std::ostringstream line;
+  line << std::left << std::setw(5) << log_label(lvl) << " | " << content;
+  if (use_color_for(os)) {
+    os << log_color(lvl) << line.str() << "\033[0m" << '\n';
+  } else {
+    os << line.str() << '\n';
+  }
+}
 
 static std::mutex        g_log_mtx;
 static std::condition_variable g_log_cv;
@@ -78,7 +133,8 @@ static std::deque<LogItem> g_log_q;
 static inline void log_enqueue(LogLevel lvl, std::string msg) {
   if (!g_repl_active.load(std::memory_order_relaxed)) {
     std::ostream& os = (lvl == LogLevel::Error) ? std::cerr : std::cout;
-    os << msg << std::endl;
+    write_log_line(lvl, msg, os);
+    os.flush();
     return;
   }
   {
@@ -114,19 +170,17 @@ static inline bool drain_logs_and_refresh(EditLine* el_or_null) {
 
   if (local.empty()) return false;
 
-  // clear current line once
+  // clear current line once so the prompt vanishes while we print logs
   std::fputs("\r\033[K", stdout);  // CR + clear-to-end-of-line
 
   for (auto& it : local) {
     std::ostream& os = (it.level == LogLevel::Error) ? std::cerr : std::cout;
-    os << it.text << '\n';
+    write_log_line(it.level, it.text, os);
   }
   std::cout.flush();
   std::cerr.flush();
 
   if (el_or_null) {
-    // Ensure libedit’s buffer is empty, then repaint the prompt…
-    el_replacestr(el_or_null, "");
     el_set(el_or_null, EL_REFRESH, 0);
     // …and NOW clear any leftover characters to the right of the cursor.
     std::fputs("\033[K", stdout); // prevents log output from slicing through a partially typed line
@@ -143,6 +197,201 @@ static inline void wait_for_logs_or_timeout(int ms) {
   if (g_log_q.empty()) {
     g_log_cv.wait_for(lk, std::chrono::milliseconds(ms));
   }
+}
+
+// ----------------------------
+// Live-view monitor helpers
+// ----------------------------
+
+static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
+
+  bool window_created = false;
+  try {
+    cv::namedWindow(kMonitorWindowName, cv::WINDOW_AUTOSIZE);
+    window_created = true;
+  } catch (const cv::Exception& ex) {
+    LOGE("[monitor] Failed to create OpenCV window: " << ex.what());
+    g_monitor_running.store(false, std::memory_order_release);
+    g_monitor_stop_flag.store(false, std::memory_order_release);
+    return;
+  }
+
+  std::unique_ptr<SDK::CrImageDataBlock> image_block(new (std::nothrow) SDK::CrImageDataBlock());
+  if (!image_block) {
+    LOGE("[monitor] Unable to allocate image block");
+    if (window_created) cv::destroyWindow(kMonitorWindowName);
+    g_monitor_running.store(false, std::memory_order_release);
+    g_monitor_stop_flag.store(false, std::memory_order_release);
+    return;
+  }
+
+  std::vector<CrInt8u> buffer;
+  CrInt32u last_buf_capacity = 0;
+
+  while (!g_monitor_stop_flag.load(std::memory_order_acquire) &&
+         !g_stop.load(std::memory_order_acquire)) {
+
+    if (!handle) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+
+    SDK::CrImageInfo info{};
+    auto info_res = SDK::GetLiveViewImageInfo(handle, &info);
+    if (info_res != SDK::CrError_None) {
+      if (info_res != SDK::CrWarning_Frame_NotUpdated && verbose) {
+        LOGE("[monitor] GetLiveViewImageInfo failed: " << crsdk_err::error_to_name(info_res)
+              << " (0x" << std::hex << static_cast<unsigned>(info_res) << std::dec << ")");
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+
+    CrInt32u capacity = info.GetBufferSize();
+    if (capacity == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      continue;
+    }
+
+    if (capacity != last_buf_capacity) {
+      buffer.assign(capacity, 0);
+      image_block->SetSize(capacity);
+      image_block->SetData(buffer.data());
+      last_buf_capacity = capacity;
+    }
+
+    auto lv_res = SDK::GetLiveViewImage(handle, image_block.get());
+    if (lv_res == SDK::CrWarning_Frame_NotUpdated) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      continue;
+    }
+    if (lv_res == SDK::CrError_Memory_Insufficient) {
+      if (verbose) {
+        LOGE("[monitor] Live view memory insufficient");
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+    if (lv_res != SDK::CrError_None) {
+      LOGE("[monitor] Live view fetch failed: " << crsdk_err::error_to_name(lv_res)
+            << " (0x" << std::hex << static_cast<unsigned>(lv_res) << std::dec << ")");
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      continue;
+    }
+
+    CrInt32u actual = image_block->GetImageSize();
+    if (actual == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    }
+
+    cv::Mat raw(1, static_cast<int>(actual), CV_8UC1, image_block->GetImageData());
+    cv::Mat frame;
+    try {
+      frame = cv::imdecode(raw, cv::IMREAD_COLOR);
+    } catch (const cv::Exception& ex) {
+      LOGE("[monitor] imdecode error: " << ex.what());
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+
+    if (frame.empty()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    }
+
+    try {
+      cv::imshow(kMonitorWindowName, frame);
+    } catch (const cv::Exception& ex) {
+      LOGE("[monitor] imshow error: " << ex.what());
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+
+    int key = cv::waitKey(1);
+    if (key == 27 || key == 'q' || key == 'Q') {
+      g_monitor_stop_flag.store(true, std::memory_order_release);
+      break;
+    }
+  }
+
+  if (window_created) {
+    try {
+      cv::destroyWindow(kMonitorWindowName);
+    } catch (const cv::Exception& ex) {
+      LOGE("[monitor] destroyWindow error: " << ex.what());
+    }
+  }
+
+  g_monitor_running.store(false, std::memory_order_release);
+  g_monitor_stop_flag.store(false, std::memory_order_release);
+  LOGI("[monitor] stopped");
+}
+
+static bool monitor_start(SDK::CrDeviceHandle handle, bool verbose) {
+  if (!handle) {
+    LOGE("Camera handle not available; cannot start monitor.");
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(g_monitor_mtx);
+    if (g_monitor_running.load(std::memory_order_acquire)) {
+      LOGI("[monitor] already running");
+      return true;
+    }
+    g_monitor_stop_flag.store(false, std::memory_order_release);
+  }
+
+  CrInt32u live_view_enabled = 0;
+  auto get_res = SDK::GetDeviceSetting(handle, SDK::Setting_Key_EnableLiveView, &live_view_enabled);
+  if (get_res != SDK::CrError_None || live_view_enabled == 0) {
+    auto set_res = SDK::SetDeviceSetting(handle, SDK::Setting_Key_EnableLiveView, 1);
+    if (set_res != SDK::CrError_None) {
+      LOGE("[monitor] Failed to enable live view: " << crsdk_err::error_to_name(set_res)
+           << " (0x" << std::hex << static_cast<unsigned>(set_res) << std::dec << ")");
+      return false;
+    }
+  }
+
+  try {
+    std::lock_guard<std::mutex> lk(g_monitor_mtx);
+    g_monitor_running.store(true, std::memory_order_release);
+    g_monitor_thread = std::thread(monitor_thread_main, handle, verbose);
+  } catch (const std::exception& ex) {
+    LOGE("[monitor] Failed to launch thread: " << ex.what());
+    g_monitor_running.store(false, std::memory_order_release);
+    g_monitor_stop_flag.store(false, std::memory_order_release);
+    return false;
+  }
+
+  LOGI("[monitor] started (press ESC in the window or run 'monitor stop')");
+  return true;
+}
+
+static void monitor_stop() {
+  std::thread local;
+  {
+    std::lock_guard<std::mutex> lk(g_monitor_mtx);
+    if (!g_monitor_thread.joinable()) {
+      g_monitor_running.store(false, std::memory_order_release);
+      g_monitor_stop_flag.store(false, std::memory_order_release);
+      return;
+    }
+    g_monitor_stop_flag.store(true, std::memory_order_release);
+    try {
+      cv::destroyWindow(kMonitorWindowName);
+    } catch (const cv::Exception& ex) {
+      LOGE("[monitor] destroyWindow error: " << ex.what());
+    }
+    local = std::move(g_monitor_thread);
+  }
+
+  if (local.joinable()) {
+    local.join();
+  }
+  g_monitor_running.store(false, std::memory_order_release);
+  g_monitor_stop_flag.store(false, std::memory_order_release);
 }
 
 // poll()-based getchar so logs can wake the REPL
@@ -400,7 +649,9 @@ public:
 
   void OnDisconnected(CrInt32u error) override {
     if (g_shutting_down.load()) return;
-    LOGI( "[CB] OnDisconnected: 0x" << std::hex << error << std::dec << " (" << crsdk_err::error_to_name(error) << ")" );
+    if (verbose) {
+      LOGI( "[CB] OnDisconnected: 0x" << std::hex << error << std::dec << " (" << crsdk_err::error_to_name(error) << ")" );
+    }
     {
       std::lock_guard<std::mutex> lk(mtx); last_error_code = error; conn_finished = true;
     }
@@ -442,7 +693,9 @@ private:
 	last_prop_vals[code] = val;
 	if (verbose) {
 	  const char *name = crsdk_util::prop_code_to_name(code);
-	  LOGI( tag << ": " << name << " (0x" << std::hex << code << std::dec << ") -> " << (long long)val );
+      if (verbose) {
+        LOGI( tag << ": " << name << " (0x" << std::hex << code << std::dec << ") -> " << (long long)val );
+      }
 	}
       }
     }
@@ -463,7 +716,9 @@ public:
     if (g_shutting_down.load()) return;
     if (g_stop.load(std::memory_order_relaxed)) return;
     
-    LOGI( "[CB] ContentsListChanged: notify=0x" << std::hex << notify << std::dec << " slot=" << slotNumber << " add=" << addSize );
+    if (verbose) {
+      LOGI( "[CB] ContentsListChanged: notify=0x" << std::hex << notify << std::dec << " slot=" << slotNumber << " add=" << addSize );
+    }
     if (notify != SDK::CrNotify_RemoteTransfer_Changed_Add) return;
 
     // Was this invocation triggered by a manual sync?
@@ -492,11 +747,11 @@ public:
 	  if (!list || count == 0) return;
 
 	  if (is_sync && g_sync_abort.load(std::memory_order_relaxed)) {
-	    LOGI("Sync: stopped (slot " << (int)slot << ").");
+	    if (verbose) LOGI("Sync: stopped (slot " << (int)slot << ").");
 	    return; // bail out before planning/logging
 	  }
 	  
-	  LOGI("[SYNC] slot " << (int)slot << ": planning " << count << " item(s)"
+	  if (verbose) LOGI("[SYNC] slot " << (int)slot << ": planning " << count << " item(s)"
 	       << (sync_all ? " (all days)" : ""));
 	  
 	  // For "sync all", we want everything; otherwise keep your newest-first N logic
@@ -567,7 +822,7 @@ public:
 	      std::string candidatePath = join_path(destDir, orig);
 	      if (is_sync) {
 		if (std::filesystem::exists(candidatePath)) {
-		  LOGI("[SKIP] already present: " << join_path(relDir, orig));
+		  if (verbose) LOGI("[SKIP] already present: " << join_path(relDir, orig));
 		  dl_waiting = false;
 		  continue;
 		}
@@ -616,7 +871,7 @@ public:
 	  resList = SDK::GetRemoteTransferCapturedDateList(handle, slot, &dateList, &dateNums);
 	  if (resList != SDK::CrError_None || !dateList || dateNums == 0) {
 	    if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
+	    if (verbose) LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
 	    return;
 	  }
 
@@ -674,7 +929,7 @@ public:
 	    SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
 	    if (resList != SDK::CrError_None || !list || count == 0) {
 	      if (list) { SDK::ReleaseRemoteTransferContentsInfoList(handle, list); }
-	      LOGI("[INFO] No contents found for latest day (slot=" << (int)slot << ")");
+	      if (verbose) LOGI("[INFO] No contents found for latest day (slot=" << (int)slot << ")");
 	      return;
 	    }
 
@@ -682,7 +937,7 @@ public:
 	    SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
 	  } else {
 	    if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
+	    if (verbose) LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
 	    return;
 	  }
 	}
@@ -717,7 +972,7 @@ public:
       bool perc_ok = (dl_last_log_per == 101) || (per >= dl_last_log_per + 5);
 
       if (time_ok || perc_ok) {
-	LOGI("[DL] " << (label.empty() ? "(unknown file)" : label) << " — " << per << "%");
+	  if (verbose) LOGI("[DL] " << (label.empty() ? "(unknown file)" : label) << " — " << per << "%");
 	dl_last_log_per = per;
 	dl_last_log_tp = now;
 	dl_any_progress = true;
@@ -743,7 +998,7 @@ public:
 
       // For small files (no progress logs), this is the ONLY line.
       LOGI("[PHOTO] " << base << " (" << sizeB << " bytes"
-	   << ", " << elapsed_ms << " ms)");
+           << ", " << elapsed_ms << " ms)");
 
       if (!g_post_cmd.empty() && !saved.empty()) run_post_cmd(g_post_cmd, saved);
 
@@ -801,7 +1056,7 @@ static bool try_connect_once(const std::string &explicit_ip,
   // -------- Discover or create camera object --------
   const bool using_direct_ip = !explicit_ip.empty();
   if (!using_direct_ip) {
-    LOGI("Searching for cameras...");
+    if (verbose) LOGI("Searching for cameras...");
     err = SDK::EnumCameraObjects(&enum_list, 1);
     if (err != SDK::CrError_None || !enum_list || enum_list->GetCount() == 0) {
       LOGE("No cameras found (EnumCameraObjects)");
@@ -857,19 +1112,19 @@ static bool try_connect_once(const std::string &explicit_ip,
   if (fp_from_obj_len > 0 && fp_from_obj_len <= sizeof(fp_from_obj)) {
     fp_ptr = fp_from_obj;
     fp_len = fp_from_obj_len;
-    LOGI("[FP] using fingerprint from discovered camera (" << fp_len << " bytes)");
+    if (verbose) LOGI("[FP] using fingerprint from discovered camera (" << fp_len << " bytes)");
   } else if (!fp_cache.empty()) {
     fp_ptr = (CrChar*)fp_cache.data();
     fp_len = (CrInt32u)fp_cache.size();
-    LOGI("[FP] using cached fingerprint (" << fp_len << " bytes)");
+    if (verbose) LOGI("[FP] using cached fingerprint (" << fp_len << " bytes)");
   } else {
-    LOGI("[FP] no fingerprint available for initial connect");
+    if (verbose) LOGI("[FP] no fingerprint available for initial connect");
   }
 
   // -------- SSH/Access-Auth support & reconnecting flag --------
   bool ssh_on = (selected && selected->GetSSHsupport() == SDK::CrSSHsupport_ON);
-  LOGI(std::string("[AUTH] Authenticating (ssh support is ") + (ssh_on ? "on" : "off") + ")");
-  if (user_ptr) LOGI("[AUTH] Using username to connect");
+  if (verbose) LOGI(std::string("[AUTH] Authenticating (ssh support is ") + (ssh_on ? "on" : "off") + ")");
+  if (user_ptr && verbose) LOGI("[AUTH] Using username to connect");
 
   bool is_direct_ip = (created != nullptr);
   
@@ -883,7 +1138,9 @@ static bool try_connect_once(const std::string &explicit_ip,
     reconnecting = SDK::CrReconnecting_OFF;
   }
   
-  // -------- Connect --------
+ // -------- Connect --------
+  std::string target_desc = explicit_ip.empty() ? "camera" : ("camera at " + explicit_ip);
+  LOGI("Connecting to " << target_desc << "...");
   err = SDK::Connect(const_cast<SDK::ICrCameraObjectInfo *>(selected), &cb, &handle,
                      SDK::CrSdkControlMode_RemoteTransfer, reconnecting,
                      const_cast<CrChar*>(user_ptr),
@@ -892,7 +1149,7 @@ static bool try_connect_once(const std::string &explicit_ip,
   
   if (err != SDK::CrError_None && is_direct_ip && (unsigned)err == 0x8202) {
     // Transport refused the path we chose. Retry once with the opposite SSH flag.
-    LOGE("Connect failed 0x8202; retrying once with opposite SSH support flag...");
+    if (verbose) LOGE("Connect failed 0x8202; retrying once with opposite SSH support flag...");
     
     // Recreate the IP object with flipped SSH support.
     CrInt32u flipped = (selected->GetSSHsupport() == SDK::CrSSHsupport_ON)
@@ -946,22 +1203,26 @@ static bool try_connect_once(const std::string &explicit_ip,
   }
 
   cb.device_handle = handle;
-  LOGI("Connected. Ctrl+C to stop.");
+    if (verbose) {
+      LOGI("Connected. Ctrl+C to stop.");
+    } else {
+      LOGI("Connected. Ctrl+C to stop.");
+    }
 
   // -------- Persist (updated) fingerprint for next run --------
   {
     char newfp[512] = {0}; CrInt32u nlen = 0;
     SDK::GetFingerprint(const_cast<SDK::ICrCameraObjectInfo *>(selected), newfp, &nlen);
-    LOGI("[FP] GetFingerprint(ICrCameraObjectInfo*): " << nlen << " bytes");
+    if (verbose) LOGI("[FP] GetFingerprint(ICrCameraObjectInfo*): " << nlen << " bytes");
 
     if (nlen > 0 && nlen <= sizeof(newfp)) {
       if (save_fingerprint(fp_path, newfp, nlen)) {
-        LOGI("[FP] saved " << nlen << " bytes to " << fp_path);
+        if (verbose) LOGI("[FP] saved " << nlen << " bytes to " << fp_path);
       } else {
         LOGE("[FP] failed to save fingerprint to " << fp_path);
       }
     } else {
-      LOGI("[FP] no fingerprint to save (nlen=0)");
+      if (verbose) LOGI("[FP] no fingerprint to save (nlen=0)");
     }
   }
 
@@ -979,7 +1240,7 @@ static void disconnect_and_release(SDK::CrDeviceHandle &handle,
 
 // simple word list
 static const std::vector<std::string> commands = {
-  "shoot", "focus", "sync", "quit", "exit"
+  "shoot", "trigger", "focus", "sync", "monitor", "poweroff", "quit", "exit"
 };
 
 char* prompt(EditLine*) {
@@ -1023,6 +1284,8 @@ struct Context {
 };
 
 int main(int argc, char **argv) {
+  std::setlocale(LC_CTYPE, "");
+
   install_signal_handlers();
   block_sigint_in_this_thread();
 
@@ -1079,7 +1342,7 @@ int main(int argc, char **argv) {
 	cleanup_sdk();
 	return 2;
       }
-      LOGI( "Retrying in " << g_keepalive.count() << " ms..." );
+      if (verbose) LOGI( "Retrying in " << g_keepalive.count() << " ms..." );
 
       // Allow Ctrl-C to work while we wait to retry.
       unblock_sigint_in_this_thread();
@@ -1099,7 +1362,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    inputThread = std::thread([handle, &cb]() {
+    inputThread = std::thread([handle, &cb, verbose]() {
       
       unblock_sigint_in_this_thread();
       
@@ -1141,12 +1404,47 @@ int main(int argc, char **argv) {
 	  //if (args.size() < 2) { std::cerr << "usage: connect <host>\n"; return 2; }
 	  ctx.handle = handle;
 
-	  SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Down);
+	  if (verbose) LOGI("Capture image...");
+
+	  SDK::CrDeviceProperty s1;
+	  s1.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
+	  s1.SetValueType(SDK::CrDataType::CrDataType_UInt16);
+	  s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
+	  auto s1_lock_err = SDK::SetDeviceProperty(handle, &s1);
+	  if (s1_lock_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(s1_lock_err);
+	    LOGE("Failed to half-press shutter: " << crsdk_err::error_to_name(s1_lock_err) << " (0x" << std::hex << code << std::dec << ")");
+	    return 2;
+	  }
 	  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-	  SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Up);
-	  LOGI( "Shutter triggered." );
+
+	  if (verbose) LOGI("Shutter down");
+	  auto down_err = SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Down);
+	  if (down_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(down_err);
+	    LOGE("Shutter down failed: " << crsdk_err::error_to_name(down_err) << " (0x" << std::hex << code << std::dec << ")");
+	  }
+	  std::this_thread::sleep_for(std::chrono::milliseconds(35));
+
+	  if (verbose) LOGI("Shutter up");
+	  auto up_err = SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Up);
+	  if (up_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(up_err);
+	    LOGE("Shutter up failed: " << crsdk_err::error_to_name(up_err) << " (0x" << std::hex << code << std::dec << ")");
+	  }
+
+	  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+	  s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+	  auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
+	  if (s1_unlock_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(s1_unlock_err);
+	    LOGE("Failed to release half-press: " << crsdk_err::error_to_name(s1_unlock_err) << " (0x" << std::hex << code << std::dec << ")");
+	  }
 
 	  return 0;
+	}},
+	{"trigger", [&](auto const& args)->int {
+	  return cmd.at("shoot")(args);
 	}},
 	{"focus", [&](auto const& args)->int {
 	  //if (args.size() < 2) { std::cerr << "usage: capture start|stop\n"; return 2; }
@@ -1155,15 +1453,31 @@ int main(int argc, char **argv) {
 	  //else { std::cerr << "unknown capture subcommand\n"; return 2; }
 
 	  ctx.handle = handle;
+	  if (verbose) LOGI("S1 shooting...");
+	  if (verbose) LOGI("Shutter Half Press down");
 	  SDK::CrDeviceProperty prop;
 	  prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
-	  prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
 	  prop.SetValueType(SDK::CrDataType::CrDataType_UInt16);
-	  SDK::SetDeviceProperty(handle, &prop);
+	  prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
+	  auto s1_lock_err = SDK::SetDeviceProperty(handle, &prop);
+	  if (s1_lock_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(s1_lock_err);
+	    LOGE("Failed to half-press shutter: " << crsdk_err::error_to_name(s1_lock_err) << " (0x" << std::hex << code << std::dec << ")");
+	    return 2;
+	  }
+
 	  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+	  if (verbose) LOGI("Shutter Half Press up");
 	  prop.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-	  SDK::SetDeviceProperty(handle, &prop);
-	  LOGI("Autofocus activated.");
+	  auto s1_unlock_err = SDK::SetDeviceProperty(handle, &prop);
+	  if (s1_unlock_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(s1_unlock_err);
+	    LOGE("Failed to release half-press: " << crsdk_err::error_to_name(s1_unlock_err) << " (0x" << std::hex << code << std::dec << ")");
+	    return 2;
+	  }
+
+	  if (verbose) LOGI("Focus complete.");
 	  
 	  return 0;
 	}},
@@ -1241,6 +1555,41 @@ int main(int argc, char **argv) {
 	  // Return immediately; user can keep typing/issuing commands
 	  return 0;
 	}},
+	{"monitor", [&](auto const& args)->int {
+	  if (args.size() < 2) {
+	    LOGE("usage: monitor start|stop");
+	    return 2;
+	  }
+	  std::string sub = args[1];
+	  std::transform(sub.begin(), sub.end(), sub.begin(), [](unsigned char c){ return std::tolower(c); });
+	  if (sub == "start") {
+	    bool ok = monitor_start(handle, verbose);
+	    return ok ? 0 : 2;
+	  }
+	  if (sub == "stop") {
+	    monitor_stop();
+	    return 0;
+	  }
+	  LOGE("usage: monitor start|stop");
+	  return 2;
+	}},
+	{"poweroff", [&](auto const& args)->int {
+	  (void)args;
+	  if (!handle) {
+	    LOGE("Camera handle not available; cannot power off.");
+	    return 2;
+	  }
+	  LOGI("Sending power-off command to camera...");
+	  auto err = SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_PowerOff, SDK::CrCommandParam_Down);
+	  if (err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(err);
+	    LOGE("Power-off command failed: " << crsdk_err::error_to_name(err) << " (0x" << std::hex << code << std::dec << ")");
+	    return 2;
+	  }
+	  LOGI("Power-off command sent; waiting for camera to disconnect...");
+	  g_stop.store(true, std::memory_order_relaxed);
+	  return 99;
+	}},
 	{"quit", [&](auto const&)->int {
 	  g_stop.store(true, std::memory_order_relaxed);   // <<< unify shutdown
 	  return 99;
@@ -1316,9 +1665,9 @@ int main(int argc, char **argv) {
 
       g_repl_active.store(false, std::memory_order_relaxed);
 
-      // makes sure the next shutdown line is printed on the next line
-      // instead of next to the prompt (looks nicer)
-      LOGI("");
+      // Ensure the prompt line is cleared so shutdown logs start cleanly
+      std::fputs("\r\033[K", stdout);
+      std::fflush(stdout);
 
     });
 
@@ -1329,13 +1678,14 @@ int main(int argc, char **argv) {
 
     // 1) Stop the REPL first so it cannot redraw a prompt during shutdown.
     if (inputThread.joinable()) {
+      monitor_stop();
       // Nudge the REPL in case it’s waiting on poll(): send a wake byte.
       if (g_wake_pipe[1] != -1) { char x = 0; (void)!write(g_wake_pipe[1], &x, 1); }
       inputThread.join();
     }
     
     // 2) Now log and disconnect the camera; no prompt can appear anymore.
-    LOGI( "Shutting down connection..." );
+    if (verbose) LOGI( "Shutting down connection..." );
     disconnect_and_release(handle, created, enum_list);
     
     // 3) Join any download workers.
@@ -1355,7 +1705,7 @@ int main(int argc, char **argv) {
       break;
     }
 
-    LOGI( "Disconnected; will retry in " << g_keepalive.count() << " ms..." );
+    if (verbose) LOGI( "Disconnected; will retry in " << g_keepalive.count() << " ms..." );
 
     // Allow Ctrl-C during keepalive sleep after disconnects too.
     unblock_sigint_in_this_thread();
@@ -1364,6 +1714,7 @@ int main(int argc, char **argv) {
   }
 
   LOGI( "Shutting down..." );
+  monitor_stop();
   for (auto &t : g_downloadThreads) {
     if (t.joinable()) t.join();
   }
