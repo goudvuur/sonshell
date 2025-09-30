@@ -52,6 +52,7 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 | `sync stop` | Gracefully cancel an in-progress sync after the current file finishes. |
 | `sync on` | Resume automatic downloads triggered by new captures (default). |
 | `sync off` | Pause automatic downloads triggered by new captures. |
+| `status` | Show current exposure, focus, and media settings reported by the camera. |
 | `monitor start` | Launch the live-view window; closes automatically when you close the window or run `monitor stop`. |
 | `monitor stop` | Stop live-view streaming and close the OpenCV window. |
 | `record start` | Begin movie recording (simulates the camera's record button). |

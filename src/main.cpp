@@ -18,6 +18,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cmath>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -113,6 +114,426 @@ static const char* movie_recording_state_to_string(SDK::CrMovie_Recording_State 
     case SDK::CrMovie_Recording_State_IntervalRec_Waiting_Record: return "IntervalWaiting";
     default: return "Unknown";
   }
+}
+
+static std::string hex_code(CrInt64u value) {
+  std::ostringstream oss;
+  oss << "0x" << std::hex << std::uppercase << value;
+  return oss.str();
+}
+
+static std::string decode_cr_string(const CrInt16u* raw) {
+  if (!raw) return {};
+  CrInt16u length = *raw;
+  if (length <= 1) return {};
+  std::string out;
+  out.reserve(length);
+  const CrInt16u* p = raw + 1;
+  for (int i = 0; i < length - 1; ++i, ++p) {
+    // SDK strings are UTF-16; best effort conversion assuming ASCII subset.
+    out.push_back(static_cast<char>(*p & 0xFF));
+  }
+  return out;
+}
+
+static std::string format_f_number(CrInt64u raw) {
+  CrInt32u val = static_cast<CrInt32u>(raw & 0xFFFF);
+  if (val == 0 || val == SDK::CrFnumber_Unknown || val == SDK::CrFnumber_Nothing) return "f/--";
+  double f = static_cast<double>(val) / 100.0;
+  std::ostringstream oss;
+  oss << "f/";
+  if (std::fabs(f - std::round(f)) < 0.05) {
+    oss << std::fixed << std::setprecision(0) << f;
+  } else if (f < 10.0) {
+    oss << std::fixed << std::setprecision(1) << f;
+  } else {
+    oss << std::fixed << std::setprecision(0) << f;
+  }
+  return oss.str();
+}
+
+static std::string format_shutter_speed(CrInt64u raw) {
+  CrInt32u val = static_cast<CrInt32u>(raw);
+  if (val == SDK::CrShutterSpeed_Bulb) return "Bulb";
+  if (val == SDK::CrShutterSpeed_Nothing || val == 0) return "--";
+  CrInt16u numerator = static_cast<CrInt16u>(val >> 16);
+  CrInt16u denominator = static_cast<CrInt16u>(val & 0xFFFFu);
+  if (denominator == 0) return hex_code(val);
+  std::ostringstream oss;
+  if (numerator == 1) {
+    oss << "1/" << denominator;
+  } else if (numerator % denominator == 0) {
+    oss << (numerator / denominator) << '\"';
+  } else {
+    double seconds = static_cast<double>(numerator) / static_cast<double>(denominator);
+    if (seconds < 10.0) {
+      oss << std::fixed << std::setprecision(2) << seconds << '\"';
+    } else {
+      oss << std::fixed << std::setprecision(1) << seconds << '\"';
+    }
+  }
+  return oss.str();
+}
+
+static std::string format_iso_value(CrInt64u raw) {
+  CrInt32u iso = static_cast<CrInt32u>(raw);
+  CrInt32u iso_mode = (iso >> 24) & 0x0F;
+  CrInt32u iso_value = (iso & 0x00FFFFFFu);
+  std::ostringstream oss;
+  if (iso_mode == SDK::CrISO_MultiFrameNR) oss << "Multi NR ";
+  else if (iso_mode == SDK::CrISO_MultiFrameNR_High) oss << "Multi NR High ";
+  if (iso_value == SDK::CrISO_AUTO) oss << "ISO AUTO";
+  else oss << "ISO " << iso_value;
+  return oss.str();
+}
+
+static std::string format_iso_current(CrInt64u raw) {
+  CrInt32u iso = static_cast<CrInt32u>(raw);
+  if (iso == 0 || iso == SDK::CrISO_AUTO) return {};
+  std::ostringstream oss;
+  oss << "ISO " << iso;
+  return oss.str();
+}
+
+static std::string exposure_program_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrExposureProgram>(static_cast<CrInt32u>(raw));
+  switch (mode) {
+    case SDK::CrExposure_M_Manual: return "Manual";
+    case SDK::CrExposure_P_Auto: return "Program";
+    case SDK::CrExposure_A_AperturePriority: return "Aperture Priority";
+    case SDK::CrExposure_S_ShutterSpeedPriority: return "Shutter Priority";
+    case SDK::CrExposure_Program_Creative: return "Creative";
+    case SDK::CrExposure_Program_Action: return "Action";
+    case SDK::CrExposure_Portrait: return "Portrait";
+    case SDK::CrExposure_Auto: return "Auto";
+    case SDK::CrExposure_Auto_Plus: return "Auto+";
+    case SDK::CrExposure_Sports_Action: return "Sports";
+    case SDK::CrExposure_Sunset: return "Sunset";
+    case SDK::CrExposure_Night: return "Night";
+    case SDK::CrExposure_Landscape: return "Landscape";
+    case SDK::CrExposure_Macro: return "Macro";
+    case SDK::CrExposure_HandheldTwilight: return "Handheld Twilight";
+    case SDK::CrExposure_NightPortrait: return "Night Portrait";
+    case SDK::CrExposure_AntiMotionBlur: return "Anti Motion Blur";
+    case SDK::CrExposure_Pet: return "Pet";
+    case SDK::CrExposure_Gourmet: return "Gourmet";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt32u>(raw));
+}
+
+static std::string drive_mode_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrDriveMode>(static_cast<CrInt32u>(raw));
+  switch (mode) {
+    case SDK::CrDrive_Single: return "Single";
+    case SDK::CrDrive_Continuous_Hi: return "Cont High";
+    case SDK::CrDrive_Continuous_Hi_Plus: return "Cont High+";
+    case SDK::CrDrive_Continuous_Lo: return "Cont Low";
+    case SDK::CrDrive_Continuous: return "Continuous";
+    case SDK::CrDrive_Continuous_SpeedPriority: return "Cont Speed Priority";
+    case SDK::CrDrive_Continuous_Mid: return "Cont Mid";
+    case SDK::CrDrive_Continuous_Lo_Live: return "Cont Low Live";
+    case SDK::CrDrive_SingleBurstShooting_lo: return "Single Burst (Lo)";
+    case SDK::CrDrive_SingleBurstShooting_mid: return "Single Burst (Mid)";
+    case SDK::CrDrive_SingleBurstShooting_hi: return "Single Burst (Hi)";
+    case SDK::CrDrive_FocusBracket: return "Focus Bracket";
+    case SDK::CrDrive_Timelapse: return "Timelapse";
+    case SDK::CrDrive_Timer_2s: return "Self Timer 2s";
+    case SDK::CrDrive_Timer_5s: return "Self Timer 5s";
+    case SDK::CrDrive_Timer_10s: return "Self Timer 10s";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt32u>(raw));
+}
+
+static std::string focus_mode_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrFocusMode>(static_cast<CrInt16u>(raw));
+  switch (mode) {
+    case SDK::CrFocus_MF: return "MF";
+    case SDK::CrFocus_AF_S: return "AF-S";
+    case SDK::CrFocus_AF_C: return "AF-C";
+    case SDK::CrFocus_AF_A: return "AF-A";
+    case SDK::CrFocus_AF_D: return "AF-D";
+    case SDK::CrFocus_DMF: return "DMF";
+    case SDK::CrFocus_PF: return "PF";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt16u>(raw));
+}
+
+static std::string focus_area_to_string(CrInt64u raw) {
+  auto area = static_cast<SDK::CrFocusArea>(static_cast<CrInt16u>(raw));
+  switch (area) {
+    case SDK::CrFocusArea_Wide: return "Wide";
+    case SDK::CrFocusArea_Zone: return "Zone";
+    case SDK::CrFocusArea_Center: return "Center";
+    case SDK::CrFocusArea_Flexible_Spot_S: return "Flexible Spot (S)";
+    case SDK::CrFocusArea_Flexible_Spot_M: return "Flexible Spot (M)";
+    case SDK::CrFocusArea_Flexible_Spot_L: return "Flexible Spot (L)";
+    case SDK::CrFocusArea_Expand_Flexible_Spot: return "Expand Flexible Spot";
+    case SDK::CrFocusArea_Flexible_Spot: return "Flexible Spot";
+    case SDK::CrFocusArea_Tracking_Wide: return "Tracking Wide";
+    case SDK::CrFocusArea_Tracking_Zone: return "Tracking Zone";
+    case SDK::CrFocusArea_Tracking_Center: return "Tracking Center";
+    case SDK::CrFocusArea_Tracking_Flexible_Spot_S: return "Tracking Flex (S)";
+    case SDK::CrFocusArea_Tracking_Flexible_Spot_M: return "Tracking Flex (M)";
+    case SDK::CrFocusArea_Tracking_Flexible_Spot_L: return "Tracking Flex (L)";
+    case SDK::CrFocusArea_Tracking_Expand_Flexible_Spot: return "Tracking Expand Flex";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt16u>(raw));
+}
+
+static std::string white_balance_to_string(CrInt64u raw) {
+  auto wb = static_cast<SDK::CrWhiteBalanceSetting>(static_cast<CrInt16u>(raw));
+  switch (wb) {
+    case SDK::CrWhiteBalance_AWB: return "Auto";
+    case SDK::CrWhiteBalance_Underwater_Auto: return "Underwater Auto";
+    case SDK::CrWhiteBalance_Daylight: return "Daylight";
+    case SDK::CrWhiteBalance_Shadow: return "Shade";
+    case SDK::CrWhiteBalance_Cloudy: return "Cloudy";
+    case SDK::CrWhiteBalance_Tungsten: return "Tungsten";
+    case SDK::CrWhiteBalance_Fluorescent: return "Fluorescent";
+    case SDK::CrWhiteBalance_Fluorescent_WarmWhite: return "Fluorescent Warm";
+    case SDK::CrWhiteBalance_Fluorescent_CoolWhite: return "Fluorescent Cool";
+    case SDK::CrWhiteBalance_Fluorescent_DayWhite: return "Fluorescent Day";
+    case SDK::CrWhiteBalance_Fluorescent_Daylight: return "Fluorescent Daylight";
+    case SDK::CrWhiteBalance_Flush: return "Flash";
+    case SDK::CrWhiteBalance_ColorTemp: return "Color Temp";
+    case SDK::CrWhiteBalance_Custom_1: return "Custom 1";
+    case SDK::CrWhiteBalance_Custom_2: return "Custom 2";
+    case SDK::CrWhiteBalance_Custom_3: return "Custom 3";
+    case SDK::CrWhiteBalance_Custom: return "Custom";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt16u>(raw));
+}
+
+static std::string steady_shot_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrImageStabilizationSteadyShot>(static_cast<CrInt8u>(raw));
+  switch (mode) {
+    case SDK::CrImageStabilizationSteadyShot_Off: return "Off";
+    case SDK::CrImageStabilizationSteadyShot_On: return "On";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt8u>(raw));
+}
+
+static std::string steady_shot_movie_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrImageStabilizationSteadyShotMovie>(static_cast<CrInt8u>(raw));
+  switch (mode) {
+    case SDK::CrImageStabilizationSteadyShotMovie_Off: return "Off";
+    case SDK::CrImageStabilizationSteadyShotMovie_Standard: return "Standard";
+    case SDK::CrImageStabilizationSteadyShotMovie_Active: return "Active";
+    case SDK::CrImageStabilizationSteadyShotMovie_DynamicActive: return "Dynamic Active";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt8u>(raw));
+}
+
+static std::string silent_mode_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrSilentMode>(static_cast<CrInt8u>(raw));
+  switch (mode) {
+    case SDK::CrSilentMode_Off: return "Off";
+    case SDK::CrSilentMode_On: return "On";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt8u>(raw));
+}
+
+static std::string shutter_type_to_string(CrInt64u raw) {
+  auto type = static_cast<SDK::CrShutterType>(static_cast<CrInt8u>(raw));
+  switch (type) {
+    case SDK::CrShutterType_Auto: return "Auto";
+    case SDK::CrShutterType_MechanicalShutter: return "Mechanical";
+    case SDK::CrShutterType_ElectronicShutter: return "Electronic";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt8u>(raw));
+}
+
+static std::string movie_mode_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrMovieShootingMode>(static_cast<CrInt16u>(raw));
+  switch (mode) {
+    case SDK::CrMovieShootingMode_Off: return "Off";
+    case SDK::CrMovieShootingMode_CineEI: return "Cine EI";
+    case SDK::CrMovieShootingMode_CineEIQuick: return "Cine EI Quick";
+    case SDK::CrMovieShootingMode_Custom: return "Custom";
+    case SDK::CrMovieShootingMode_FlexibleISO: return "Flexible ISO";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt16u>(raw));
+}
+
+static std::string movie_media_to_string(CrInt64u raw) {
+  auto media = static_cast<SDK::CrRecordingMediaMovie>(static_cast<CrInt16u>(raw));
+  switch (media) {
+    case SDK::CrRecordingMediaMovie_Slot1: return "Slot 1";
+    case SDK::CrRecordingMediaMovie_Slot2: return "Slot 2";
+    case SDK::CrRecordingMediaMovie_SimultaneousRecording: return "Simul";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt16u>(raw));
+}
+
+static std::string movie_recording_setting_to_string(CrInt64u raw) {
+  auto setting = static_cast<SDK::CrRecordingSettingMovie>(static_cast<CrInt16u>(raw));
+  switch (setting) {
+    case SDK::CrRecordingSettingMovie_60p_50M: return "60p 50M XAVC S";
+    case SDK::CrRecordingSettingMovie_30p_50M: return "30p 50M XAVC S";
+    case SDK::CrRecordingSettingMovie_24p_50M: return "24p 50M XAVC S";
+    case SDK::CrRecordingSettingMovie_50p_50M: return "50p 50M XAVC S";
+    case SDK::CrRecordingSettingMovie_25p_50M: return "25p 50M XAVC S";
+    case SDK::CrRecordingSettingMovie_60i_24M: return "60i 24M AVCHD";
+    case SDK::CrRecordingSettingMovie_50i_24M_FX: return "50i 24M AVCHD";
+    case SDK::CrRecordingSettingMovie_60i_17M_FH: return "60i 17M AVCHD";
+    case SDK::CrRecordingSettingMovie_50i_17M_FH: return "50i 17M AVCHD";
+    case SDK::CrRecordingSettingMovie_60p_28M_PS: return "60p 28M AVCHD";
+    case SDK::CrRecordingSettingMovie_50p_28M_PS: return "50p 28M AVCHD";
+    case SDK::CrRecordingSettingMovie_24p_24M_FX: return "24p 24M AVCHD";
+    case SDK::CrRecordingSettingMovie_25p_24M_FX: return "25p 24M AVCHD";
+    case SDK::CrRecordingSettingMovie_24p_17M_FH: return "24p 17M AVCHD";
+    case SDK::CrRecordingSettingMovie_25p_17M_FH: return "25p 17M AVCHD";
+    case SDK::CrRecordingSettingMovie_120p_50M_1280x720: return "120p 50M 720p XAVC S";
+    case SDK::CrRecordingSettingMovie_100p_50M_1280x720: return "100p 50M 720p XAVC S";
+    case SDK::CrRecordingSettingMovie_1920x1080_30p_16M: return "1080 30p 16M MP4";
+    case SDK::CrRecordingSettingMovie_1920x1080_25p_16M: return "1080 25p 16M MP4";
+    case SDK::CrRecordingSettingMovie_1280x720_30p_6M: return "720 30p 6M MP4";
+    case SDK::CrRecordingSettingMovie_1280x720_25p_6M: return "720 25p 6M MP4";
+    case SDK::CrRecordingSettingMovie_1920x1080_60p_28M: return "1080 60p 28M MP4";
+    case SDK::CrRecordingSettingMovie_1920x1080_50p_28M: return "1080 50p 28M MP4";
+    default: break;
+  }
+  return hex_code(static_cast<CrInt16u>(raw));
+}
+
+static std::string focus_bracket_shots_to_string(CrInt64u raw) {
+  CrInt32u val = static_cast<CrInt32u>(raw);
+  if (val == 0) return {};
+  std::ostringstream oss;
+  oss << val;
+  return oss.str();
+}
+
+static std::string focus_bracket_range_to_string(CrInt64u raw) {
+  CrInt32u val = static_cast<CrInt32u>(raw);
+  if (val == 0) return {};
+  std::ostringstream oss;
+  oss << val;
+  return oss.str();
+}
+
+struct PropertyValue {
+  bool supported = false;
+  CrInt64u value = 0;
+  std::string text;
+};
+
+static PropertyValue fetch_property(SDK::CrDeviceHandle handle, CrInt32u code) {
+  PropertyValue out;
+  SDK::CrDeviceProperty* props = nullptr;
+  CrInt32 count = 0;
+  auto err = SDK::GetSelectDeviceProperties(handle, 1, &code, &props, &count);
+  if (err != SDK::CrError_None || count <= 0 || !props) {
+    return out;
+  }
+  const auto flag = props[0].GetPropertyEnableFlag();
+  if (flag != SDK::CrEnableValue_NotSupported && flag != SDK::CrEnableValue_False) {
+    out.supported = true;
+    out.value = props[0].GetCurrentValue();
+    if (props[0].GetValueType() == SDK::CrDataType::CrDataType_STR) {
+      out.text = decode_cr_string(props[0].GetCurrentStr());
+    }
+  }
+  SDK::ReleaseDeviceProperties(handle, props);
+  return out;
+}
+
+struct StatusSnapshot {
+  std::string model = "--";
+  std::string lens = "--";
+  std::string serial = "--";
+  std::string f_number = "--";
+  std::string shutter = "--";
+  std::string iso = "--";
+  std::string iso_actual;
+  std::string exposure_program = "--";
+  std::string drive_mode = "--";
+  std::string focus_mode = "--";
+  std::string focus_area = "--";
+  std::string focus_bracket_shots;
+  std::string focus_bracket_range;
+  std::string white_balance = "--";
+  std::string steady_still = "--";
+  std::string steady_movie = "--";
+  std::string silent_mode = "--";
+  std::string shutter_type = "--";
+  std::string movie_mode = "--";
+  std::string movie_setting = "--";
+  std::string movie_media = "--";
+  std::string recording_state = "--";
+};
+
+static bool collect_status_snapshot(SDK::CrDeviceHandle handle, StatusSnapshot& snap, bool verbose) {
+  bool any = false;
+
+  auto assign_formatted = [&](CrInt32u code, auto formatter, std::string& target) {
+    PropertyValue p = fetch_property(handle, code);
+    if (!p.supported) return;
+    target = formatter(p.value);
+    any = true;
+  };
+
+  PropertyValue model = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_ModelName);
+  if (model.supported && !model.text.empty()) { snap.model = model.text; any = true; }
+
+  PropertyValue lens = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_LensModelName);
+  if (lens.supported && !lens.text.empty()) { snap.lens = lens.text; any = true; }
+
+  PropertyValue serial = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_BodySerialNumber);
+  if (serial.supported && !serial.text.empty()) { snap.serial = serial.text; any = true; }
+
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_FNumber, format_f_number, snap.f_number);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_ShutterSpeed, format_shutter_speed, snap.shutter);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_IsoSensitivity, format_iso_value, snap.iso);
+
+  PropertyValue iso_actual = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_IsoCurrentSensitivity);
+  if (iso_actual.supported) {
+    snap.iso_actual = format_iso_current(iso_actual.value);
+    any = true;
+  }
+
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureProgramMode, exposure_program_to_string, snap.exposure_program);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_DriveMode, drive_mode_to_string, snap.drive_mode);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_FocusMode, focus_mode_to_string, snap.focus_mode);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_FocusArea, focus_area_to_string, snap.focus_area);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_WhiteBalance, white_balance_to_string, snap.white_balance);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_ImageStabilizationSteadyShot, steady_shot_to_string, snap.steady_still);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_Movie_ImageStabilizationSteadyShot, steady_shot_movie_to_string, snap.steady_movie);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_SilentMode, silent_mode_to_string, snap.silent_mode);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_ShutterType, shutter_type_to_string, snap.shutter_type);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_MovieShootingMode, movie_mode_to_string, snap.movie_mode);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_Movie_Recording_Setting, movie_recording_setting_to_string, snap.movie_setting);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_Movie_RecordingMedia, movie_media_to_string, snap.movie_media);
+
+  PropertyValue rec_state = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_RecordingState);
+  if (rec_state.supported) {
+    snap.recording_state = movie_recording_state_to_string(static_cast<SDK::CrMovie_Recording_State>(static_cast<CrInt16u>(rec_state.value)));
+    any = true;
+  }
+
+  PropertyValue bracket_shots = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_FocusBracketShotNumber);
+  if (bracket_shots.supported) {
+    snap.focus_bracket_shots = focus_bracket_shots_to_string(bracket_shots.value);
+    any = true;
+  }
+  PropertyValue bracket_range = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_FocusBracketFocusRange);
+  if (bracket_range.supported) {
+    snap.focus_bracket_range = focus_bracket_range_to_string(bracket_range.value);
+    any = true;
+  }
+
+  return any;
 }
 
 static bool fetch_movie_recording_state(SDK::CrDeviceHandle handle,
@@ -1461,7 +1882,7 @@ static void disconnect_and_release(SDK::CrDeviceHandle &handle,
 
 // simple word list
 static const std::vector<std::string> commands = {
-  "shoot", "trigger", "focus", "sync", "monitor", "record", "poweroff", "quit", "exit"
+  "shoot", "trigger", "focus", "sync", "monitor", "record", "status", "poweroff", "quit", "exit"
 };
 
 char* prompt(EditLine*) {
@@ -1845,6 +2266,43 @@ int main(int argc, char **argv) {
 	  }
 
 	  // Return immediately; user can keep typing/issuing commands
+	  return 0;
+	}},
+	{"status", [&](auto const& args)->int {
+	  (void)args;
+	  if (!handle) {
+	    LOGE("status: camera handle unavailable");
+	    return 2;
+	  }
+	  StatusSnapshot snap;
+	  bool got_any = collect_status_snapshot(handle, snap, verbose);
+	  if (!got_any) {
+	    LOGW("status: camera did not report detailed properties; showing defaults.");
+	  }
+	  std::string iso_display = snap.iso;
+	  if (!snap.iso_actual.empty() && snap.iso_actual != snap.iso) {
+	    if (!iso_display.empty() && iso_display != "--") iso_display += " [" + snap.iso_actual + "]";
+	    else iso_display = snap.iso_actual;
+	  }
+	  std::string bracket_info;
+	  if (!snap.focus_bracket_shots.empty()) {
+	    bracket_info = "; Bracket: " + snap.focus_bracket_shots;
+	    if (!snap.focus_bracket_range.empty()) {
+	      bracket_info += " (range " + snap.focus_bracket_range + ")";
+	    }
+	  }
+	  LOGI("Status:");
+	  LOGI("  Body: " << snap.model << "  Lens: " << snap.lens << "  Serial: " << snap.serial);
+	  LOGI("  Exposure: " << snap.f_number << "  " << snap.shutter << "  " << iso_display
+	       << "; Mode: " << snap.exposure_program);
+	  LOGI("  Focus: " << snap.focus_mode << "  Area: " << snap.focus_area
+	       << "; Drive: " << snap.drive_mode << bracket_info);
+	  LOGI("  Color: WB " << snap.white_balance << "; Silent: " << snap.silent_mode
+	       << "; Shutter: " << snap.shutter_type);
+	  LOGI("  Stabilization: Still " << snap.steady_still << " / Movie " << snap.steady_movie
+	       << "; Movie mode: " << snap.movie_mode);
+	  LOGI("  Video: Setting " << snap.movie_setting << "; Media: " << snap.movie_media
+	       << "; Recording: " << snap.recording_state);
 	  return 0;
 	}},
 	{"record", [&](auto const& args)->int {
