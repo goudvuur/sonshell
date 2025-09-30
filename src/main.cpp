@@ -2,8 +2,10 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
@@ -18,6 +20,8 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <limits>
+#include <numeric>
 #include <cmath>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -193,6 +197,319 @@ static std::string format_iso_current(CrInt64u raw) {
   std::ostringstream oss;
   oss << "ISO " << iso;
   return oss.str();
+}
+
+static std::string format_exposure_compensation(CrInt64u raw) {
+  CrInt16 val = static_cast<CrInt16>(static_cast<CrInt16u>(raw & 0xFFFFu));
+  double ev = static_cast<double>(val) / 1000.0;
+  if (std::fabs(ev) < 0.001) return "0";
+  std::ostringstream oss;
+  oss << std::showpos;
+  if (std::fabs(ev - std::round(ev)) < 0.05) {
+    oss << std::fixed << std::setprecision(0) << ev;
+  } else if (std::fabs(ev * 2.0 - std::round(ev * 2.0)) < 0.05) {
+    oss << std::fixed << std::setprecision(1) << ev;
+  } else {
+    oss << std::fixed << std::setprecision(2) << ev;
+  }
+  return oss.str();
+}
+
+static std::string trim_copy(std::string s) {
+  auto begin = std::find_if_not(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); });
+  auto end = std::find_if_not(s.rbegin(), s.rend(), [](unsigned char c) { return std::isspace(c); }).base();
+  if (begin >= end) return {};
+  return std::string(begin, end);
+}
+
+static std::string join_args(const std::vector<std::string>& args, size_t start) {
+  if (start >= args.size()) return {};
+  std::string out = args[start];
+  for (size_t i = start + 1; i < args.size(); ++i) {
+    out.push_back(' ');
+    out.append(args[i]);
+  }
+  return out;
+}
+
+static std::string to_lower_ascii(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return s;
+}
+
+static std::string normalize_identifier(std::string s) {
+  std::string trimmed = trim_copy(std::move(s));
+  std::string out;
+  out.reserve(trimmed.size());
+  for (char ch : trimmed) {
+    unsigned char c = static_cast<unsigned char>(ch);
+    if (std::isspace(c) || ch == '-' || ch == '_' || ch == '+') continue;
+    out.push_back(static_cast<char>(std::tolower(c)));
+  }
+  return out;
+}
+
+static bool parse_exposure_mode_token(const std::string& raw, SDK::CrExposureProgram& out) {
+  std::string key = normalize_identifier(raw);
+  if (key.empty()) return false;
+  static const std::pair<const char*, SDK::CrExposureProgram> kModeMap[] = {
+    {"manual", SDK::CrExposure_M_Manual},
+    {"m", SDK::CrExposure_M_Manual},
+    {"program", SDK::CrExposure_P_Auto},
+    {"p", SDK::CrExposure_P_Auto},
+    {"creative", SDK::CrExposure_Program_Creative},
+    {"action", SDK::CrExposure_Program_Action},
+    {"aperturepriority", SDK::CrExposure_A_AperturePriority},
+    {"aperture", SDK::CrExposure_A_AperturePriority},
+    {"a", SDK::CrExposure_A_AperturePriority},
+    {"shutterpriority", SDK::CrExposure_S_ShutterSpeedPriority},
+    {"shutter", SDK::CrExposure_S_ShutterSpeedPriority},
+    {"s", SDK::CrExposure_S_ShutterSpeedPriority},
+    {"auto", SDK::CrExposure_Auto},
+    {"autoplus", SDK::CrExposure_Auto_Plus},
+    {"sports", SDK::CrExposure_Sports_Action},
+    {"sportsaction", SDK::CrExposure_Sports_Action},
+    {"sunset", SDK::CrExposure_Sunset},
+    {"night", SDK::CrExposure_Night},
+    {"landscape", SDK::CrExposure_Landscape},
+    {"portrait", SDK::CrExposure_Portrait},
+    {"macro", SDK::CrExposure_Macro},
+    {"handheldtwilight", SDK::CrExposure_HandheldTwilight},
+    {"nightportrait", SDK::CrExposure_NightPortrait},
+    {"antimotionblur", SDK::CrExposure_AntiMotionBlur},
+    {"pet", SDK::CrExposure_Pet},
+    {"gourmet", SDK::CrExposure_Gourmet},
+    {"moviep", SDK::CrExposure_Movie_P},
+    {"moviea", SDK::CrExposure_Movie_A},
+    {"movies", SDK::CrExposure_Movie_S},
+    {"moviem", SDK::CrExposure_Movie_M},
+    {"movieauto", SDK::CrExposure_Movie_Auto}
+  };
+  for (auto const& entry : kModeMap) {
+    if (key == entry.first) {
+      out = entry.second;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool parse_iso_token(const std::string& raw, CrInt32u& out) {
+  std::string token = trim_copy(raw);
+  if (token.empty()) return false;
+  std::string lower = to_lower_ascii(token);
+  if (lower.rfind("iso", 0) == 0) {
+    lower.erase(0, 3);
+    lower = trim_copy(lower);
+  }
+  if (lower.empty()) return false;
+  if (lower == "auto" || lower == "a") {
+    out = SDK::CrISO_AUTO;
+    return true;
+  }
+  char* endptr = nullptr;
+  long val = std::strtol(lower.c_str(), &endptr, 10);
+  if (!lower.empty() && endptr && *endptr == '\0' && val > 0 && val <= 0xFFFFFF) {
+    out = static_cast<CrInt32u>(val) & 0x00FFFFFFu;
+    return true;
+  }
+  return false;
+}
+
+static bool parse_fnumber_token(const std::string& raw, CrInt16u& out) {
+  std::string token = trim_copy(raw);
+  if (token.empty()) return false;
+  if (!token.empty() && (token[0] == 'f' || token[0] == 'F')) {
+    token.erase(0, 1);
+    if (!token.empty() && (token[0] == '/' || token[0] == '\\')) {
+      token.erase(0, 1);
+    }
+  }
+  token = trim_copy(token);
+  if (token.empty()) return false;
+  try {
+    double value = std::stod(token);
+    if (!(value > 0.0)) return false;
+    double scaled = std::round(value * 100.0);
+    if (scaled <= 0.0 || scaled > 0xFFFF) return false;
+    out = static_cast<CrInt16u>(scaled);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static bool encode_shutter_seconds(double seconds, CrInt32u& out) {
+  if (!(seconds > 0.0)) return false;
+  const int kMaxDen = 1000;
+  int numerator = 0;
+  int denominator = 0;
+  bool found = false;
+  for (int d = 1; d <= kMaxDen; ++d) {
+    double n = seconds * static_cast<double>(d);
+    double rounded = std::round(n);
+    if (std::fabs(n - rounded) < 1e-4) {
+      numerator = static_cast<int>(rounded);
+      denominator = d;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    denominator = kMaxDen;
+    numerator = static_cast<int>(std::round(seconds * static_cast<double>(denominator)));
+  }
+  if (numerator <= 0 || denominator <= 0) return false;
+  int g = std::gcd(numerator, denominator);
+  numerator /= g;
+  denominator /= g;
+  if (numerator <= 0 || numerator > 0xFFFF || denominator <= 0 || denominator > 0xFFFF) return false;
+  out = (static_cast<CrInt32u>(numerator) << 16) | static_cast<CrInt32u>(denominator);
+  return true;
+}
+
+static bool parse_shutter_token(const std::string& raw, CrInt32u& out) {
+  std::string token = trim_copy(raw);
+  if (token.empty()) return false;
+  std::string lower = to_lower_ascii(token);
+  if (lower == "bulb") {
+    out = SDK::CrShutterSpeed_Bulb;
+    return true;
+  }
+  auto slash = lower.find('/');
+  if (slash != std::string::npos) {
+    std::string num_str = trim_copy(lower.substr(0, slash));
+    std::string den_str = trim_copy(lower.substr(slash + 1));
+    if (num_str.empty() || den_str.empty()) return false;
+    try {
+      int numerator = std::stoi(num_str);
+      int denominator = std::stoi(den_str);
+      if (numerator <= 0 || denominator <= 0 || numerator > 0xFFFF || denominator > 0xFFFF) return false;
+      out = (static_cast<CrInt32u>(numerator) << 16) | static_cast<CrInt32u>(denominator);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  while (!lower.empty() && (lower.back() == '"' || std::isspace(static_cast<unsigned char>(lower.back())))) {
+    lower.pop_back();
+  }
+  if (!lower.empty() && lower.back() == 's') {
+    lower.pop_back();
+  }
+  if (lower.size() >= 3 && lower.substr(lower.size() - 3) == "sec") {
+    lower.erase(lower.size() - 3);
+  }
+  lower = trim_copy(lower);
+  if (lower.empty()) return false;
+
+  try {
+    double seconds = std::stod(lower);
+    return encode_shutter_seconds(seconds, out);
+  } catch (...) {
+    return false;
+  }
+}
+
+static bool parse_exposure_comp_token(const std::string& raw, CrInt16& out) {
+  std::string token = trim_copy(raw);
+  if (token.empty()) return false;
+  std::string lower = to_lower_ascii(token);
+  if (lower.size() > 2 && lower.substr(lower.size() - 2) == "ev") {
+    lower.erase(lower.size() - 2);
+    lower = trim_copy(lower);
+  }
+  if (lower == "reset" || lower == "0" || lower == "+0" || lower == "-0") {
+    out = 0;
+    return true;
+  }
+  auto slash = lower.find('/');
+  double value = 0.0;
+  if (slash != std::string::npos) {
+    std::string num_str = trim_copy(lower.substr(0, slash));
+    std::string den_str = trim_copy(lower.substr(slash + 1));
+    if (den_str.empty()) return false;
+    try {
+      double numerator = std::stod(num_str);
+      double denominator = std::stod(den_str);
+      if (denominator == 0.0) return false;
+      value = numerator / denominator;
+    } catch (...) {
+      return false;
+    }
+  } else {
+    try {
+      value = std::stod(lower);
+    } catch (...) {
+      return false;
+    }
+  }
+  if (!std::isfinite(value)) return false;
+  double scaled = std::round(value * 1000.0);
+  if (scaled < std::numeric_limits<CrInt16>::min() || scaled > std::numeric_limits<CrInt16>::max()) return false;
+  out = static_cast<CrInt16>(scaled);
+  return true;
+}
+
+using ExposureHandler = int(*)(SDK::CrDeviceHandle, bool, const std::vector<std::string>&, size_t);
+
+struct ExposureSubcommand {
+  const char* name;
+  const char* usage;
+  size_t min_args;
+  size_t max_args;
+  ExposureHandler handler;
+};
+
+static constexpr size_t kExposureUnlimitedArgs = std::numeric_limits<size_t>::max();
+
+static int exposure_show_handler(SDK::CrDeviceHandle handle, bool verbose,
+                                 const std::vector<std::string>& args, size_t start_index);
+static int exposure_mode_handler(SDK::CrDeviceHandle handle, bool verbose,
+                                 const std::vector<std::string>& args, size_t start_index);
+static int exposure_iso_handler(SDK::CrDeviceHandle handle, bool verbose,
+                                const std::vector<std::string>& args, size_t start_index);
+static int exposure_aperture_handler(SDK::CrDeviceHandle handle, bool verbose,
+                                     const std::vector<std::string>& args, size_t start_index);
+static int exposure_shutter_handler(SDK::CrDeviceHandle handle, bool verbose,
+                                    const std::vector<std::string>& args, size_t start_index);
+static int exposure_comp_handler(SDK::CrDeviceHandle handle, bool verbose,
+                                 const std::vector<std::string>& args, size_t start_index);
+static void log_exposure_usage();
+
+static constexpr const char* kExposureUsageShow = "usage: exposure show";
+static constexpr const char* kExposureUsageMode =
+    "usage: exposure mode [manual|program|aperture|shutter|auto|autoplus|sports|sunset|... ]";
+static constexpr const char* kExposureUsageIso = "usage: exposure iso [value]";
+static constexpr const char* kExposureUsageAperture = "usage: exposure aperture [f-number]";
+static constexpr const char* kExposureUsageShutter = "usage: exposure shutter [value]";
+static constexpr const char* kExposureUsageComp = "usage: exposure comp [value]";
+
+static const std::array<ExposureSubcommand, 12> kExposureSubcommands = {{
+  {"show", kExposureUsageShow, 0, 0, &exposure_show_handler},
+  {"mode", kExposureUsageMode, 0, kExposureUnlimitedArgs, &exposure_mode_handler},
+  {"iso", kExposureUsageIso, 0, kExposureUnlimitedArgs, &exposure_iso_handler},
+  {"sensitivity", kExposureUsageIso, 0, kExposureUnlimitedArgs, &exposure_iso_handler},
+  {"aperture", kExposureUsageAperture, 0, kExposureUnlimitedArgs, &exposure_aperture_handler},
+  {"f", kExposureUsageAperture, 0, kExposureUnlimitedArgs, &exposure_aperture_handler},
+  {"fnumber", kExposureUsageAperture, 0, kExposureUnlimitedArgs, &exposure_aperture_handler},
+  {"shutter", kExposureUsageShutter, 0, kExposureUnlimitedArgs, &exposure_shutter_handler},
+  {"speed", kExposureUsageShutter, 0, kExposureUnlimitedArgs, &exposure_shutter_handler},
+  {"comp", kExposureUsageComp, 0, kExposureUnlimitedArgs, &exposure_comp_handler},
+  {"compensation", kExposureUsageComp, 0, kExposureUnlimitedArgs, &exposure_comp_handler},
+  {"ev", kExposureUsageComp, 0, kExposureUnlimitedArgs, &exposure_comp_handler}
+}};
+
+static const ExposureSubcommand* find_exposure_subcommand(const std::string& key) {
+  for (auto const& entry : kExposureSubcommands) {
+    if (key == entry.name) {
+      return &entry;
+    }
+  }
+  return nullptr;
 }
 
 static std::string exposure_program_to_string(CrInt64u raw) {
@@ -673,6 +990,232 @@ static inline void log_enqueue(LogLevel lvl, std::string msg) {
 #define LOGW(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Warn,  _oss.str()); } while(0)
 #define LOGE(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Error, _oss.str()); } while(0)
 #define LOGD(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Debug, _oss.str()); } while(0)
+
+static void log_exposure_usage() {
+  LOGE("usage: exposure <show|mode|iso|aperture|shutter|comp>");
+  LOGI("  show                 Display current exposure metrics");
+  LOGI("  mode [value]         Get or set exposure mode (manual, program, aperture, shutter, auto, ...)");
+  LOGI("  iso [value]          Get or set ISO (e.g. auto, 100, 6400)");
+  LOGI("  aperture [value]     Get or set aperture (e.g. f/2.8, 5.6)");
+  LOGI("  shutter [value]      Get or set shutter speed (e.g. 1/125, 0.5s, bulb)");
+  LOGI("  comp [value]         Get or set exposure compensation (e.g. +1.0, -0.3, reset)");
+}
+
+static int exposure_show_handler(SDK::CrDeviceHandle handle, bool verbose,
+                                 const std::vector<std::string>& args, size_t start_index) {
+  (void)args;
+  (void)start_index;
+  StatusSnapshot snap;
+  bool got_any = collect_status_snapshot(handle, snap, verbose);
+  if (!got_any) {
+    LOGW("exposure show: camera did not report detailed properties; showing defaults.");
+  }
+  std::string iso_display = snap.iso;
+  if (!snap.iso_actual.empty() && snap.iso_actual != snap.iso) {
+    if (!iso_display.empty() && iso_display != "--") {
+      iso_display += " [" + snap.iso_actual + "]";
+    } else {
+      iso_display = snap.iso_actual;
+    }
+  }
+  PropertyValue comp = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureBiasCompensation);
+  std::string comp_display = comp.supported ? format_exposure_compensation(comp.value) : "--";
+
+  LOGI("Exposure:");
+  LOGI("  Mode: " << snap.exposure_program);
+  LOGI("  Aperture: " << snap.f_number << "  Shutter: " << snap.shutter);
+  LOGI("  ISO: " << (iso_display.empty() ? std::string("--") : iso_display)
+       << "  EV: " << comp_display);
+  return 0;
+}
+
+static int exposure_mode_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
+                                 const std::vector<std::string>& args, size_t start_index) {
+  PropertyValue current = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureProgramMode);
+  if (start_index >= args.size()) {
+    if (!current.supported) {
+      LOGW("exposure mode: camera did not report the current mode.");
+      return 2;
+    }
+    LOGI("Exposure mode: " << exposure_program_to_string(current.value));
+    return 0;
+  }
+
+  std::string input = join_args(args, start_index);
+  SDK::CrExposureProgram parsed{};
+  if (!parse_exposure_mode_token(input, parsed)) {
+    LOGE("exposure mode: unknown mode '" << input << "'.");
+    LOGI("Examples: manual, program, aperture, shutter, auto, autoplus, sports");
+    return 2;
+  }
+  if (!current.supported) {
+    LOGW("exposure mode: camera did not report support; attempting to set anyway.");
+  }
+
+  SDK::CrDeviceProperty prop;
+  prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureProgramMode);
+  prop.SetValueType(SDK::CrDataType::CrDataType_UInt32);
+  prop.SetCurrentValue(static_cast<CrInt32u>(parsed));
+  auto err = SDK::SetDeviceProperty(handle, &prop);
+  if (err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(err);
+    LOGE("exposure mode: failed to set value: " << crsdk_err::error_to_name(err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return 2;
+  }
+  LOGI("Exposure mode set to " << exposure_program_to_string(static_cast<CrInt64u>(parsed)));
+  return 0;
+}
+
+static int exposure_iso_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
+                                const std::vector<std::string>& args, size_t start_index) {
+  PropertyValue current = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_IsoSensitivity);
+  if (start_index >= args.size()) {
+    if (!current.supported) {
+      LOGW("exposure iso: camera did not report ISO sensitivity.");
+      return 2;
+    }
+    std::string iso_display = format_iso_value(current.value);
+    PropertyValue iso_actual = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_IsoCurrentSensitivity);
+    if (iso_actual.supported) {
+      std::string actual = format_iso_current(iso_actual.value);
+      if (!actual.empty() && actual != iso_display) {
+        if (!iso_display.empty() && iso_display != "--") iso_display += " [" + actual + "]";
+        else iso_display = actual;
+      }
+    }
+    LOGI("ISO: " << (iso_display.empty() ? std::string("--") : iso_display));
+    return 0;
+  }
+
+  std::string input = join_args(args, start_index);
+  CrInt32u encoded = 0;
+  if (!parse_iso_token(input, encoded)) {
+    LOGE("exposure iso: invalid value '" << input << "'.");
+    LOGI("Examples: exposure iso auto | exposure iso 100 | exposure iso 6400");
+    return 2;
+  }
+
+  SDK::CrDeviceProperty prop;
+  prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_IsoSensitivity);
+  prop.SetValueType(SDK::CrDataType::CrDataType_UInt32);
+  prop.SetCurrentValue(encoded);
+  auto err = SDK::SetDeviceProperty(handle, &prop);
+  if (err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(err);
+    LOGE("exposure iso: failed to set value: " << crsdk_err::error_to_name(err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return 2;
+  }
+  LOGI("ISO sensitivity set to " << format_iso_value(static_cast<CrInt64u>(encoded)));
+  return 0;
+}
+
+static int exposure_aperture_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
+                                     const std::vector<std::string>& args, size_t start_index) {
+  PropertyValue current = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_FNumber);
+  if (start_index >= args.size()) {
+    if (!current.supported) {
+      LOGW("exposure aperture: camera did not report aperture value.");
+      return 2;
+    }
+    LOGI("Aperture: " << format_f_number(current.value));
+    return 0;
+  }
+
+  std::string input = join_args(args, start_index);
+  CrInt16u encoded = 0;
+  if (!parse_fnumber_token(input, encoded)) {
+    LOGE("exposure aperture: invalid value '" << input << "'.");
+    LOGI("Examples: exposure aperture f/4 | exposure aperture 2.8");
+    return 2;
+  }
+
+  SDK::CrDeviceProperty prop;
+  prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_FNumber);
+  prop.SetValueType(SDK::CrDataType::CrDataType_UInt16);
+  prop.SetCurrentValue(encoded);
+  auto err = SDK::SetDeviceProperty(handle, &prop);
+  if (err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(err);
+    LOGE("exposure aperture: failed to set value: " << crsdk_err::error_to_name(err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return 2;
+  }
+  LOGI("Aperture set to " << format_f_number(static_cast<CrInt64u>(encoded)));
+  return 0;
+}
+
+static int exposure_shutter_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
+                                    const std::vector<std::string>& args, size_t start_index) {
+  PropertyValue current = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_ShutterSpeed);
+  if (start_index >= args.size()) {
+    if (!current.supported) {
+      LOGW("exposure shutter: camera did not report shutter speed.");
+      return 2;
+    }
+    LOGI("Shutter: " << format_shutter_speed(current.value));
+    return 0;
+  }
+
+  std::string input = join_args(args, start_index);
+  CrInt32u encoded = 0;
+  if (!parse_shutter_token(input, encoded)) {
+    LOGE("exposure shutter: invalid value '" << input << "'.");
+    LOGI("Examples: exposure shutter 1/125 | exposure shutter 0.5s | exposure shutter bulb");
+    return 2;
+  }
+
+  SDK::CrDeviceProperty prop;
+  prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_ShutterSpeed);
+  prop.SetValueType(SDK::CrDataType::CrDataType_UInt32);
+  prop.SetCurrentValue(encoded);
+  auto err = SDK::SetDeviceProperty(handle, &prop);
+  if (err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(err);
+    LOGE("exposure shutter: failed to set value: " << crsdk_err::error_to_name(err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return 2;
+  }
+  LOGI("Shutter speed set to " << format_shutter_speed(static_cast<CrInt64u>(encoded)));
+  return 0;
+}
+
+static int exposure_comp_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
+                                 const std::vector<std::string>& args, size_t start_index) {
+  PropertyValue current = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureBiasCompensation);
+  if (start_index >= args.size()) {
+    if (!current.supported) {
+      LOGW("exposure comp: camera did not report exposure compensation.");
+      return 2;
+    }
+    LOGI("Exposure compensation: " << format_exposure_compensation(current.value));
+    return 0;
+  }
+
+  std::string input = join_args(args, start_index);
+  CrInt16 encoded = 0;
+  if (!parse_exposure_comp_token(input, encoded)) {
+    LOGE("exposure comp: invalid value '" << input << "'.");
+    LOGI("Examples: exposure comp +1.0 | exposure comp -0.3 | exposure comp reset");
+    return 2;
+  }
+
+  SDK::CrDeviceProperty prop;
+  prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureBiasCompensation);
+  prop.SetValueType(SDK::CrDataType::CrDataType_Int16);
+  prop.SetCurrentValue(static_cast<CrInt32>(encoded));
+  auto err = SDK::SetDeviceProperty(handle, &prop);
+  if (err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(err);
+    LOGE("exposure comp: failed to set value: " << crsdk_err::error_to_name(err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return 2;
+  }
+  CrInt16u raw = static_cast<CrInt16u>(encoded);
+  LOGI("Exposure compensation set to " << format_exposure_compensation(static_cast<CrInt64u>(raw)));
+  return 0;
+}
 
 static bool send_movie_record_button_press(SDK::CrDeviceHandle handle,
                                            std::chrono::milliseconds hold_duration,
@@ -1882,7 +2425,7 @@ static void disconnect_and_release(SDK::CrDeviceHandle &handle,
 
 // simple word list
 static const std::vector<std::string> commands = {
-  "shoot", "trigger", "focus", "sync", "monitor", "record", "status", "poweroff", "quit", "exit"
+  "shoot", "trigger", "focus", "sync", "monitor", "record", "status", "exposure", "poweroff", "quit", "exit"
 };
 
 char* prompt(EditLine*) {
@@ -2267,6 +2810,29 @@ int main(int argc, char **argv) {
 
 	  // Return immediately; user can keep typing/issuing commands
 	  return 0;
+	}},
+	{"exposure", [&](auto const& args)->int {
+	  if (!handle) {
+	    LOGE("exposure: camera handle unavailable");
+	    return 2;
+	  }
+	  if (args.size() < 2) {
+	    log_exposure_usage();
+	    return 2;
+	  }
+	  std::string sub = to_lower_ascii(args[1]);
+	  const ExposureSubcommand* entry = find_exposure_subcommand(sub);
+	  if (!entry) {
+	    log_exposure_usage();
+	    return 2;
+	  }
+	  size_t extra = (args.size() > 2) ? (args.size() - 2) : 0;
+	  if (extra < entry->min_args ||
+	      (entry->max_args != kExposureUnlimitedArgs && extra > entry->max_args)) {
+	    LOGE(entry->usage);
+	    return 2;
+	  }
+	  return entry->handler(handle, verbose, args, 2);
 	}},
 	{"status", [&](auto const& args)->int {
 	  (void)args;
