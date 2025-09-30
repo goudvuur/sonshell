@@ -104,6 +104,35 @@ static bool fetch_camera_power_status(SDK::CrDeviceHandle handle,
   return ok;
 }
 
+static const char* movie_recording_state_to_string(SDK::CrMovie_Recording_State state) {
+  switch (state) {
+    case SDK::CrMovie_Recording_State_Not_Recording: return "NotRecording";
+    case SDK::CrMovie_Recording_State_Recording: return "Recording";
+    case SDK::CrMovie_Recording_State_Recording_Failed: return "RecordingFailed";
+    case SDK::CrMovie_Recording_State_IntervalRec_Waiting_Record: return "IntervalWaiting";
+    default: return "Unknown";
+  }
+}
+
+static bool fetch_movie_recording_state(SDK::CrDeviceHandle handle,
+                                        SDK::CrMovie_Recording_State& state_out,
+                                        SDK::CrError& err_out) {
+  CrInt32u prop = SDK::CrDevicePropertyCode::CrDeviceProperty_RecordingState;
+  SDK::CrDeviceProperty* props = nullptr;
+  CrInt32 count = 0;
+  err_out = SDK::GetSelectDeviceProperties(handle, 1, &prop, &props, &count);
+  if (err_out != SDK::CrError_None) {
+    return false;
+  }
+  bool ok = (count > 0);
+  if (ok) {
+    state_out = static_cast<SDK::CrMovie_Recording_State>(props[0].GetCurrentValue());
+  }
+  SDK::ReleaseDeviceProperties(handle, props);
+  err_out = SDK::CrError_None;
+  return ok;
+}
+
 static bool monitor_window_is_alive() {
   try {
     void* handle = cvGetWindowHandle(kMonitorWindowName);
@@ -222,6 +251,36 @@ static inline void log_enqueue(LogLevel lvl, std::string msg) {
 #define LOGW(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Warn,  _oss.str()); } while(0)
 #define LOGE(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Error, _oss.str()); } while(0)
 #define LOGD(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Debug, _oss.str()); } while(0)
+
+static bool send_movie_record_button_press(SDK::CrDeviceHandle handle,
+                                           std::chrono::milliseconds hold_duration,
+                                           bool verbose_logs) {
+  if (verbose_logs) LOGI("Record: button down");
+  auto down_err = SDK::SendCommand(handle,
+                                   SDK::CrCommandId::CrCommandId_MovieRecord,
+                                   SDK::CrCommandParam_Down);
+  if (down_err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(down_err);
+    LOGE("Record: button down failed: " << crsdk_err::error_to_name(down_err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return false;
+  }
+
+  std::this_thread::sleep_for(hold_duration);
+
+  if (verbose_logs) LOGI("Record: button up");
+  auto up_err = SDK::SendCommand(handle,
+                                 SDK::CrCommandId::CrCommandId_MovieRecord,
+                                 SDK::CrCommandParam_Up);
+  if (up_err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(up_err);
+    LOGE("Record: button up failed: " << crsdk_err::error_to_name(up_err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return false;
+  }
+
+  return true;
+}
 
 // Drain everything that's queued and repaint the prompt.
 // Call ONLY from the input thread that owns `el`.
@@ -1151,7 +1210,7 @@ public:
 									      std::chrono::steady_clock::now() - dl_start_tp).count();
 
       // For small files (no progress logs), this is the ONLY line.
-      LOGI("[PHOTO] " << base << " (" << sizeB << " bytes"
+      LOGI("[FILE] " << base << " (" << sizeB << " bytes"
            << ", " << elapsed_ms << " ms)");
 
       if (!g_post_cmd.empty() && !saved.empty()) run_post_cmd(g_post_cmd, saved);
@@ -1394,7 +1453,7 @@ static void disconnect_and_release(SDK::CrDeviceHandle &handle,
 
 // simple word list
 static const std::vector<std::string> commands = {
-  "shoot", "trigger", "focus", "sync", "monitor", "poweroff", "quit", "exit"
+  "shoot", "trigger", "focus", "sync", "monitor", "record", "poweroff", "quit", "exit"
 };
 
 char* prompt(EditLine*) {
@@ -1768,6 +1827,67 @@ int main(int argc, char **argv) {
 	  }
 
 	  // Return immediately; user can keep typing/issuing commands
+	  return 0;
+	}},
+	{"record", [&](auto const& args)->int {
+	  if (args.size() < 2) {
+	    LOGE("usage: record start|stop");
+	    return 2;
+	  }
+	  std::string sub = args[1];
+	  std::transform(sub.begin(), sub.end(), sub.begin(), [](unsigned char c){ return std::tolower(c); });
+	  bool want_start = (sub == "start");
+	  bool want_stop  = (sub == "stop");
+	  if (!want_start && !want_stop) {
+	    LOGE("usage: record start|stop");
+	    return 2;
+	  }
+
+	  SDK::CrMovie_Recording_State initial_state = SDK::CrMovie_Recording_State_Not_Recording;
+	  SDK::CrError state_err = SDK::CrError_None;
+	  bool have_state = fetch_movie_recording_state(handle, initial_state, state_err);
+	  if (!have_state && state_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(state_err);
+	    LOGW("Record: unable to query state: " << crsdk_err::error_to_name(state_err)
+	         << " (0x" << std::hex << code << std::dec << ")");
+	  }
+	  if (have_state && verbose) {
+	    LOGI("Record: current state " << movie_recording_state_to_string(initial_state));
+	  }
+
+	  if (want_start && have_state && initial_state == SDK::CrMovie_Recording_State_Recording) {
+	    LOGI("Record: already recording.");
+	    return 0;
+	  }
+	  if (want_stop && have_state && initial_state == SDK::CrMovie_Recording_State_Not_Recording) {
+	    LOGI("Record: already stopped.");
+	    return 0;
+	  }
+
+	  LOGI(want_start ? "Record: starting video..." : "Record: stopping video...");
+	  bool press_ok = send_movie_record_button_press(handle, std::chrono::milliseconds(200), verbose);
+	  if (!press_ok) {
+	    return 2;
+	  }
+
+	  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+	  SDK::CrMovie_Recording_State final_state = SDK::CrMovie_Recording_State_Not_Recording;
+	  SDK::CrError final_err = SDK::CrError_None;
+	  if (fetch_movie_recording_state(handle, final_state, final_err)) {
+	    LOGI("Record: camera state " << movie_recording_state_to_string(final_state));
+	    if (want_start && final_state != SDK::CrMovie_Recording_State_Recording) {
+	      LOGW("Record: camera did not report Recording state.");
+	    }
+	    if (want_stop && final_state == SDK::CrMovie_Recording_State_Recording) {
+	      LOGW("Record: camera still reports Recording; retry stop if needed.");
+	    }
+	  } else if (final_err != SDK::CrError_None) {
+	    unsigned code = static_cast<unsigned>(final_err);
+	    LOGW("Record: unable to confirm state: " << crsdk_err::error_to_name(final_err)
+	         << " (0x" << std::hex << code << std::dec << ")");
+	  }
+
 	  return 0;
 	}},
 	{"monitor", [&](auto const& args)->int {

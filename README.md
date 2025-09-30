@@ -52,6 +52,8 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 | `sync stop` | Gracefully cancel an in-progress sync after the current file finishes. |
 | `monitor start` | Launch the live-view window; closes automatically when you close the window or run `monitor stop`. |
 | `monitor stop` | Stop live-view streaming and close the OpenCV window. |
+| `record start` | Begin movie recording (simulates the camera's record button). |
+| `record stop` | Stop movie recording; warns if the camera stays in the recording state. |
 | `poweroff` | Send the camera a power-off command. |
 | `quit`, `exit` | Leave the shell and terminate the program. Shortcut: **ESC**. |
 
