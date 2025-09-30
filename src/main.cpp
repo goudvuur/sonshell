@@ -67,6 +67,7 @@ static std::atomic<int>  g_sync_active{0};   // how many boot-spawned workers ar
 static std::atomic<bool> g_sync_all{false};
 static std::atomic<bool> g_sync_abort{false};
 static std::atomic<bool> g_sync_running{false};
+static std::atomic<bool> g_auto_sync_enabled{true};
 
 static std::mutex        g_monitor_mtx;
 static std::thread       g_monitor_thread;
@@ -928,6 +929,13 @@ public:
 
     bool sync_all = is_sync && g_sync_all.load(std::memory_order_relaxed);
 
+    if (!is_sync && !g_auto_sync_enabled.load(std::memory_order_acquire)) {
+      if (verbose) {
+        LOGI("[CB] Auto-sync disabled; ignoring contents update (slot=" << slotNumber << ")");
+      }
+      return;
+    }
+
     try {
       g_downloadThreads.emplace_back([this, slotNumber, addSize, is_sync, sync_all]() {
 	if (is_sync) g_sync_active.fetch_add(1, std::memory_order_relaxed);
@@ -1706,7 +1714,17 @@ int main(int argc, char **argv) {
 	  if (args.size() >= 2) {
 	    std::string a = args[1];
 	    std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c){ return std::tolower(c); });
-	    if (a == "all") {
+	    if (a == "on") {
+	      bool was = g_auto_sync_enabled.exchange(true, std::memory_order_acq_rel);
+	      LOGI((was ? "Auto-sync already enabled." : "Auto-sync enabled."));
+	      return 0;
+	    }
+	    else if (a == "off") {
+	      bool was = g_auto_sync_enabled.exchange(false, std::memory_order_acq_rel);
+	      LOGI((was ? "Auto-sync disabled." : "Auto-sync already disabled."));
+	      return 0;
+	    }
+	    else if (a == "all") {
 	      all = true;
 	    }
 	    else if (a == "stop") {

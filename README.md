@@ -50,6 +50,8 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 | `sync <N>` | Download the most recent `N` items from each slot (skips existing files). |
 | `sync all` | Mirror every item from both slots to the download directory. |
 | `sync stop` | Gracefully cancel an in-progress sync after the current file finishes. |
+| `sync on` | Resume automatic downloads triggered by new captures (default). |
+| `sync off` | Pause automatic downloads triggered by new captures. |
 | `monitor start` | Launch the live-view window; closes automatically when you close the window or run `monitor stop`. |
 | `monitor stop` | Stop live-view streaming and close the OpenCV window. |
 | `record start` | Begin movie recording (simulates the camera's record button). |
