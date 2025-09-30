@@ -41,6 +41,7 @@
 #include "CRSDK/CrDefines.h"
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/highgui/highgui_c.h>
 
 #include "prop_names_generated.h"
 #include "error_names_generated.h"
@@ -73,14 +74,48 @@ static std::atomic<bool> g_monitor_running{false};
 static std::atomic<bool> g_monitor_stop_flag{false};
 static constexpr const char* kMonitorWindowName = "sonshell-monitor";
 
-static bool monitor_window_is_alive() {
-  try {
-    double visible = cv::getWindowProperty(kMonitorWindowName, cv::WND_PROP_VISIBLE);
-    double autosize = cv::getWindowProperty(kMonitorWindowName, cv::WND_PROP_AUTOSIZE);
-    return visible > 0.0 || autosize > 0.0;
-  } catch (const cv::Exception&) {
+static const char* camera_power_status_to_string(SDK::CrCameraPowerStatus status) {
+  switch (status) {
+    case SDK::CrCameraPowerStatus_Off: return "Off";
+    case SDK::CrCameraPowerStatus_Standby: return "Standby";
+    case SDK::CrCameraPowerStatus_PowerOn: return "PowerOn";
+    case SDK::CrCameraPowerStatus_TransitioningFromPowerOnToStandby: return "Transitioning (On → Standby)";
+    case SDK::CrCameraPowerStatus_TransitioningFromStandbyToPowerOn: return "Transitioning (Standby → On)";
+    default: return "Unknown";
+  }
+}
+
+static bool fetch_camera_power_status(SDK::CrDeviceHandle handle,
+                                      SDK::CrCameraPowerStatus& status_out,
+                                      SDK::CrError& err_out) {
+  CrInt32u prop = SDK::CrDevicePropertyCode::CrDeviceProperty_CameraPowerStatus;
+  SDK::CrDeviceProperty* props = nullptr;
+  CrInt32 count = 0;
+  err_out = SDK::GetSelectDeviceProperties(handle, 1, &prop, &props, &count);
+  if (err_out != SDK::CrError_None) {
     return false;
   }
+  bool ok = (count > 0);
+  if (ok) {
+    status_out = static_cast<SDK::CrCameraPowerStatus>(props[0].GetCurrentValue());
+  }
+  SDK::ReleaseDeviceProperties(handle, props);
+  err_out = SDK::CrError_None;
+  return ok;
+}
+
+static bool monitor_window_is_alive() {
+  try {
+    void* handle = cvGetWindowHandle(kMonitorWindowName);
+    if (handle) return true;
+  } catch (const cv::Exception&) {
+  }
+  try {
+    double visible = cv::getWindowProperty(kMonitorWindowName, cv::WND_PROP_VISIBLE);
+    return visible > 0.0;
+  } catch (const cv::Exception&) {
+  }
+  return false;
 }
 
 static void monitor_join_stale_thread() {
@@ -235,14 +270,31 @@ static inline void wait_for_logs_or_timeout(int ms) {
 static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
 
   bool window_created = false;
+  bool window_resizable = false;
+  bool window_size_initialized = false;
   try {
-    cv::namedWindow(kMonitorWindowName, cv::WINDOW_AUTOSIZE);
+    cv::namedWindow(kMonitorWindowName, cv::WINDOW_NORMAL);
+    cv::resizeWindow(kMonitorWindowName, 200, 120);
+    try {
+      cv::setWindowProperty(kMonitorWindowName, cv::WND_PROP_ASPECT_RATIO, cv::WINDOW_KEEPRATIO);
+    } catch (const cv::Exception&) {
+    }
     window_created = true;
+    window_resizable = true;
   } catch (const cv::Exception& ex) {
-    LOGE("[monitor] Failed to create OpenCV window: " << ex.what());
-    g_monitor_running.store(false, std::memory_order_release);
-    g_monitor_stop_flag.store(false, std::memory_order_release);
-    return;
+    LOGW("[monitor] WINDOW_NORMAL unavailable (" << ex.what() << "); falling back to autosize window");
+  }
+
+  if (!window_created) {
+    try {
+      cv::namedWindow(kMonitorWindowName, cv::WINDOW_AUTOSIZE);
+      window_created = true;
+    } catch (const cv::Exception& ex) {
+      LOGE("[monitor] Failed to create OpenCV window: " << ex.what());
+      g_monitor_running.store(false, std::memory_order_release);
+      g_monitor_stop_flag.store(false, std::memory_order_release);
+      return;
+    }
   }
 
   std::unique_ptr<SDK::CrImageDataBlock> image_block(new (std::nothrow) SDK::CrImageDataBlock());
@@ -259,21 +311,24 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
 
   bool window_visible_once = false;
   bool frame_displayed_once = false;
+  void* window_handle = cvGetWindowHandle(kMonitorWindowName);
 
   while (!g_monitor_stop_flag.load(std::memory_order_acquire) &&
          !g_stop.load(std::memory_order_acquire)) {
 
-    if (window_created && window_visible_once) {
-      if (!monitor_window_is_alive()) {
-        LOGI("[monitor] window closed; stopping live view");
-        g_monitor_stop_flag.store(true, std::memory_order_release);
-        break;
-      }
-    }
-
     if (!handle) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
+    }
+
+    if (frame_displayed_once) {
+      void* current_handle = cvGetWindowHandle(kMonitorWindowName);
+      if (!current_handle) {
+        LOGI("[monitor] window closed (no handle); stopping live view");
+        g_monitor_stop_flag.store(true, std::memory_order_release);
+        break;
+      }
+      if (current_handle != window_handle) window_handle = current_handle;
     }
 
     SDK::CrImageInfo info{};
@@ -313,11 +368,7 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
       continue;
     }
     if (lv_res != SDK::CrError_None) {
-      if (lv_res == SDK::CrError_Generic && !frame_displayed_once) {
-        if (verbose) {
-          LOGD("[monitor] Live view fetch returned generic error before first frame; retrying");
-        }
-      } else {
+      if (!(lv_res == SDK::CrError_Generic && !frame_displayed_once)) {
         LOGE("[monitor] Live view fetch failed: " << crsdk_err::error_to_name(lv_res)
               << " (0x" << std::hex << static_cast<unsigned>(lv_res) << std::dec << ")");
       }
@@ -346,10 +397,19 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
       continue;
     }
 
+    if (window_resizable && !window_size_initialized) {
+      try {
+        cv::resizeWindow(kMonitorWindowName, frame.cols, frame.rows);
+        window_size_initialized = true;
+      } catch (const cv::Exception&) {
+      }
+    }
+
     try {
       cv::imshow(kMonitorWindowName, frame);
       window_visible_once = true;
       frame_displayed_once = true;
+      window_handle = cvGetWindowHandle(kMonitorWindowName);
     } catch (const cv::Exception& ex) {
       LOGE("[monitor] imshow error: " << ex.what());
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -459,7 +519,7 @@ static int my_getc(EditLine* el, char* c) {
     int r = poll(fds, nfds, -1);
     if (r < 0) {
       if (errno == EINTR) {
-	if (g_stop.load(std::memory_order_relaxed)) return 0; // make el_gets() exit
+	if (g_stop.load(std::memory_order_relaxed) || g_reconnect.load(std::memory_order_relaxed)) return 0; // make el_gets() exit
 	continue; // spurious EINTR while not stopping
       }
       return -1;
@@ -476,8 +536,8 @@ static int my_getc(EditLine* el, char* c) {
       
       (void)drain_logs_and_refresh(el);
       
-      // NEW: if we're stopping, terminate read now
-      if (g_stop.load(std::memory_order_relaxed)) return 0;
+      // Terminate read now if we're stopping or reconnecting
+      if (g_stop.load(std::memory_order_relaxed) || g_reconnect.load(std::memory_order_relaxed)) return 0;
       
       continue;
     }
@@ -1741,9 +1801,35 @@ int main(int argc, char **argv) {
 	    LOGE("Power-off command failed: " << crsdk_err::error_to_name(err) << " (0x" << std::hex << code << std::dec << ")");
 	    return 2;
 	  }
+	  SDK::CrCameraPowerStatus status = SDK::CrCameraPowerStatus_PowerOn;
+	  SDK::CrError status_err = SDK::CrError_None;
+	  bool status_known = false;
+	  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+	  while (std::chrono::steady_clock::now() < deadline) {
+	    if (fetch_camera_power_status(handle, status, status_err)) {
+	      status_known = true;
+	      if (status != SDK::CrCameraPowerStatus_PowerOn &&
+	          status != SDK::CrCameraPowerStatus_TransitioningFromPowerOnToStandby) {
+	        break;
+	      }
+	    } else if (status_err != SDK::CrError_None) {
+	      break;
+	    }
+	    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	  }
+	  if (status_known) {
+	    LOGI("Camera power status: " << camera_power_status_to_string(status)
+	         << " (0x" << std::hex << static_cast<unsigned>(status) << std::dec << ")");
+	    if (status == SDK::CrCameraPowerStatus_PowerOn) {
+	      LOGW("Camera still reports PowerOn; enable 'Remote Power OFF/ON' and 'Network Standby' on the body to allow remote shutdown.");
+	    }
+	  } else if (status_err != SDK::CrError_None) {
+	    LOGW("Could not read camera power status after power-off command: "
+	         << crsdk_err::error_to_name(status_err)
+	         << " (0x" << std::hex << static_cast<unsigned>(status_err) << std::dec << ")");
+	  }
 	  LOGI("Power-off command sent; waiting for camera to disconnect...");
-	  g_stop.store(true, std::memory_order_relaxed);
-	  return 99;
+	  return 0;
 	}},
 	{"quit", [&](auto const&)->int {
 	  g_stop.store(true, std::memory_order_relaxed);   // <<< unify shutdown
@@ -1755,13 +1841,13 @@ int main(int argc, char **argv) {
 	}},
       };
 
-      while (!g_stop.load(std::memory_order_relaxed)) {
+      while (!g_stop.load(std::memory_order_relaxed) && !g_reconnect.load(std::memory_order_relaxed)) {
 
         // Print logs that arrived just before we read; NO refresh here to avoid double prompt
         (void)drain_logs_and_refresh(nullptr);
 
 	// if stop was requested while draining logs, bail *before* libedit can redraw the prompt
-	if (g_stop.load(std::memory_order_relaxed)) break;
+	if (g_stop.load(std::memory_order_relaxed) || g_reconnect.load(std::memory_order_relaxed)) break;
 
 	int count = 0;
 	errno = 0;
