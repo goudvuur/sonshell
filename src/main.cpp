@@ -34,6 +34,7 @@
 #include <histedit.h>
 #include <functional>
 #include <deque>
+#include <initializer_list>
 #include <arpa/inet.h>
 #include <clocale>
 
@@ -539,6 +540,39 @@ static std::string exposure_program_to_string(CrInt64u raw) {
   return hex_code(static_cast<CrInt32u>(raw));
 }
 
+static std::string exposure_program_label_with_token(SDK::CrExposureProgram mode) {
+  switch (mode) {
+    case SDK::CrExposure_M_Manual: return "Manual (M)";
+    case SDK::CrExposure_P_Auto: return "Program (P)";
+    case SDK::CrExposure_A_AperturePriority: return "Aperture Priority (A)";
+    case SDK::CrExposure_S_ShutterSpeedPriority: return "Shutter Priority (S)";
+    case SDK::CrExposure_Auto: return "Auto";
+    case SDK::CrExposure_Auto_Plus: return "Auto+";
+    default:
+      break;
+  }
+  return exposure_program_to_string(static_cast<CrInt64u>(mode));
+}
+
+static std::string format_mode_requirement_list(std::initializer_list<SDK::CrExposureProgram> modes) {
+  std::vector<std::string> labels;
+  labels.reserve(modes.size());
+  for (auto mode : modes) {
+    labels.push_back(exposure_program_label_with_token(mode));
+  }
+  if (labels.empty()) return {};
+  if (labels.size() == 1) return labels.front();
+  if (labels.size() == 2) return labels[0] + " or " + labels[1];
+  std::string out;
+  for (size_t i = 0; i < labels.size(); ++i) {
+    if (i > 0) {
+      out += (i + 1 == labels.size()) ? ", or " : ", ";
+    }
+    out += labels[i];
+  }
+  return out;
+}
+
 static std::string drive_mode_to_string(CrInt64u raw) {
   auto mode = static_cast<SDK::CrDriveMode>(static_cast<CrInt32u>(raw));
   switch (mode) {
@@ -991,8 +1025,39 @@ static inline void log_enqueue(LogLevel lvl, std::string msg) {
 #define LOGE(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Error, _oss.str()); } while(0)
 #define LOGD(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Debug, _oss.str()); } while(0)
 
+static void log_exposure_mode_hint(SDK::CrDeviceHandle handle,
+                                   const char* subcommand,
+                                   std::initializer_list<SDK::CrExposureProgram> required_modes) {
+  std::string requirement = format_mode_requirement_list(required_modes);
+  if (requirement.empty()) {
+    return;
+  }
+
+  PropertyValue current_mode = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureProgramMode);
+  if (current_mode.supported) {
+    std::string mode_name = exposure_program_to_string(current_mode.value);
+    LOGI("Hint: exposure " << subcommand << " requires " << requirement
+         << "; camera is currently in " << mode_name << " mode.");
+  } else {
+    LOGI("Hint: exposure " << subcommand << " requires " << requirement << '.');
+  }
+}
+
+static bool exposure_error_suggests_mode_change(SDK::CrError err) {
+  switch (err) {
+    case SDK::CrError_Api_InvalidCalled:
+    case SDK::CrError_Generic_NotSupported:
+    case SDK::CrError_Generic_InvalidParameter:
+    case SDK::CrError_Adaptor_InvalidProperty:
+      return true;
+    default:
+      break;
+  }
+  return false;
+}
+
 static void log_exposure_usage() {
-  LOGE("usage: exposure <show|mode|iso|aperture|shutter|comp>");
+  LOGI("usage: exposure <show|mode|iso|aperture|shutter|comp>");
   LOGI("  show                 Display current exposure metrics");
   LOGI("  mode [value]         Get or set exposure mode (manual, program, aperture, shutter, auto, ...)");
   LOGI("  iso [value]          Get or set ISO (e.g. auto, 100, 6400)");
@@ -1063,6 +1128,19 @@ static int exposure_mode_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
          << " (0x" << std::hex << code << std::dec << ")");
     return 2;
   }
+
+  PropertyValue confirm = fetch_property(handle, SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureProgramMode);
+  if (confirm.supported) {
+    if (confirm.value != static_cast<CrInt64u>(parsed)) {
+      LOGW("exposure mode: camera is still reporting "
+           << exposure_program_to_string(confirm.value)
+           << " mode. Many bodies require changing the physical mode dial.");
+      return 1;
+    }
+  } else {
+    LOGW("exposure mode: camera did not report the updated value; verify on the body if it changed.");
+  }
+
   LOGI("Exposure mode set to " << exposure_program_to_string(static_cast<CrInt64u>(parsed)));
   return 0;
 }
@@ -1073,6 +1151,11 @@ static int exposure_iso_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
   if (start_index >= args.size()) {
     if (!current.supported) {
       LOGW("exposure iso: camera did not report ISO sensitivity.");
+      log_exposure_mode_hint(handle, "iso",
+                             {SDK::CrExposure_M_Manual,
+                              SDK::CrExposure_P_Auto,
+                              SDK::CrExposure_A_AperturePriority,
+                              SDK::CrExposure_S_ShutterSpeedPriority});
       return 2;
     }
     std::string iso_display = format_iso_value(current.value);
@@ -1096,6 +1179,14 @@ static int exposure_iso_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
     return 2;
   }
 
+  if (!current.supported) {
+    log_exposure_mode_hint(handle, "iso",
+                           {SDK::CrExposure_M_Manual,
+                            SDK::CrExposure_P_Auto,
+                            SDK::CrExposure_A_AperturePriority,
+                            SDK::CrExposure_S_ShutterSpeedPriority});
+  }
+
   SDK::CrDeviceProperty prop;
   prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_IsoSensitivity);
   prop.SetValueType(SDK::CrDataType::CrDataType_UInt32);
@@ -1105,6 +1196,13 @@ static int exposure_iso_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
     unsigned code = static_cast<unsigned>(err);
     LOGE("exposure iso: failed to set value: " << crsdk_err::error_to_name(err)
          << " (0x" << std::hex << code << std::dec << ")");
+    if (exposure_error_suggests_mode_change(err)) {
+      log_exposure_mode_hint(handle, "iso",
+                             {SDK::CrExposure_M_Manual,
+                              SDK::CrExposure_P_Auto,
+                              SDK::CrExposure_A_AperturePriority,
+                              SDK::CrExposure_S_ShutterSpeedPriority});
+    }
     return 2;
   }
   LOGI("ISO sensitivity set to " << format_iso_value(static_cast<CrInt64u>(encoded)));
@@ -1117,6 +1215,9 @@ static int exposure_aperture_handler(SDK::CrDeviceHandle handle, bool /*verbose*
   if (start_index >= args.size()) {
     if (!current.supported) {
       LOGW("exposure aperture: camera did not report aperture value.");
+      log_exposure_mode_hint(handle, "aperture",
+                             {SDK::CrExposure_M_Manual,
+                              SDK::CrExposure_A_AperturePriority});
       return 2;
     }
     LOGI("Aperture: " << format_f_number(current.value));
@@ -1131,6 +1232,12 @@ static int exposure_aperture_handler(SDK::CrDeviceHandle handle, bool /*verbose*
     return 2;
   }
 
+  if (!current.supported) {
+    log_exposure_mode_hint(handle, "aperture",
+                           {SDK::CrExposure_M_Manual,
+                            SDK::CrExposure_A_AperturePriority});
+  }
+
   SDK::CrDeviceProperty prop;
   prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_FNumber);
   prop.SetValueType(SDK::CrDataType::CrDataType_UInt16);
@@ -1140,6 +1247,11 @@ static int exposure_aperture_handler(SDK::CrDeviceHandle handle, bool /*verbose*
     unsigned code = static_cast<unsigned>(err);
     LOGE("exposure aperture: failed to set value: " << crsdk_err::error_to_name(err)
          << " (0x" << std::hex << code << std::dec << ")");
+    if (exposure_error_suggests_mode_change(err)) {
+      log_exposure_mode_hint(handle, "aperture",
+                             {SDK::CrExposure_M_Manual,
+                              SDK::CrExposure_A_AperturePriority});
+    }
     return 2;
   }
   LOGI("Aperture set to " << format_f_number(static_cast<CrInt64u>(encoded)));
@@ -1152,6 +1264,9 @@ static int exposure_shutter_handler(SDK::CrDeviceHandle handle, bool /*verbose*/
   if (start_index >= args.size()) {
     if (!current.supported) {
       LOGW("exposure shutter: camera did not report shutter speed.");
+      log_exposure_mode_hint(handle, "shutter",
+                             {SDK::CrExposure_M_Manual,
+                              SDK::CrExposure_S_ShutterSpeedPriority});
       return 2;
     }
     LOGI("Shutter: " << format_shutter_speed(current.value));
@@ -1166,6 +1281,12 @@ static int exposure_shutter_handler(SDK::CrDeviceHandle handle, bool /*verbose*/
     return 2;
   }
 
+  if (!current.supported) {
+    log_exposure_mode_hint(handle, "shutter",
+                           {SDK::CrExposure_M_Manual,
+                            SDK::CrExposure_S_ShutterSpeedPriority});
+  }
+
   SDK::CrDeviceProperty prop;
   prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_ShutterSpeed);
   prop.SetValueType(SDK::CrDataType::CrDataType_UInt32);
@@ -1175,6 +1296,11 @@ static int exposure_shutter_handler(SDK::CrDeviceHandle handle, bool /*verbose*/
     unsigned code = static_cast<unsigned>(err);
     LOGE("exposure shutter: failed to set value: " << crsdk_err::error_to_name(err)
          << " (0x" << std::hex << code << std::dec << ")");
+    if (exposure_error_suggests_mode_change(err)) {
+      log_exposure_mode_hint(handle, "shutter",
+                             {SDK::CrExposure_M_Manual,
+                              SDK::CrExposure_S_ShutterSpeedPriority});
+    }
     return 2;
   }
   LOGI("Shutter speed set to " << format_shutter_speed(static_cast<CrInt64u>(encoded)));
@@ -1187,6 +1313,10 @@ static int exposure_comp_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
   if (start_index >= args.size()) {
     if (!current.supported) {
       LOGW("exposure comp: camera did not report exposure compensation.");
+      log_exposure_mode_hint(handle, "comp",
+                             {SDK::CrExposure_P_Auto,
+                              SDK::CrExposure_A_AperturePriority,
+                              SDK::CrExposure_S_ShutterSpeedPriority});
       return 2;
     }
     LOGI("Exposure compensation: " << format_exposure_compensation(current.value));
@@ -1201,6 +1331,13 @@ static int exposure_comp_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
     return 2;
   }
 
+  if (!current.supported) {
+    log_exposure_mode_hint(handle, "comp",
+                           {SDK::CrExposure_P_Auto,
+                            SDK::CrExposure_A_AperturePriority,
+                            SDK::CrExposure_S_ShutterSpeedPriority});
+  }
+
   SDK::CrDeviceProperty prop;
   prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_ExposureBiasCompensation);
   prop.SetValueType(SDK::CrDataType::CrDataType_Int16);
@@ -1210,6 +1347,12 @@ static int exposure_comp_handler(SDK::CrDeviceHandle handle, bool /*verbose*/,
     unsigned code = static_cast<unsigned>(err);
     LOGE("exposure comp: failed to set value: " << crsdk_err::error_to_name(err)
          << " (0x" << std::hex << code << std::dec << ")");
+    if (exposure_error_suggests_mode_change(err)) {
+      log_exposure_mode_hint(handle, "comp",
+                             {SDK::CrExposure_P_Auto,
+                              SDK::CrExposure_A_AperturePriority,
+                              SDK::CrExposure_S_ShutterSpeedPriority});
+    }
     return 2;
   }
   CrInt16u raw = static_cast<CrInt16u>(encoded);
