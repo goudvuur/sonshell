@@ -74,6 +74,7 @@ static std::atomic<bool> g_sync_all{false};
 static std::atomic<bool> g_sync_abort{false};
 static std::atomic<bool> g_sync_running{false};
 static std::atomic<bool> g_auto_sync_enabled{true};
+static std::atomic<bool> g_sigint_requested{false};
 
 static std::mutex        g_monitor_mtx;
 static std::thread       g_monitor_thread;
@@ -1676,6 +1677,8 @@ static void monitor_stop() {
 
 // poll()-based getchar so logs can wake the REPL
 static int my_getc(EditLine* el, char* c) {
+  if (!el || !c) return 0;
+
   struct pollfd fds[2];
   int nfds = 1;
   fds[0].fd = STDIN_FILENO;   fds[0].events = POLLIN; fds[0].revents = 0;
@@ -1683,6 +1686,13 @@ static int my_getc(EditLine* el, char* c) {
   if (g_wake_pipe[0] != -1) { fds[1].fd = g_wake_pipe[0]; nfds = 2; }
 
   for (;;) {
+    if (g_sigint_requested.exchange(false, std::memory_order_relaxed)) {
+      tcflush(STDIN_FILENO, TCIFLUSH);
+      el_reset(el);
+      *c = '\n';
+      return 1;
+    }
+
     int r = poll(fds, nfds, -1);
     if (r < 0) {
       if (errno == EINTR) {
@@ -1700,12 +1710,12 @@ static int my_getc(EditLine* el, char* c) {
 	if (n <= 0) break;
       }
       g_wake_pending.store(false, std::memory_order_relaxed);
-      
+
       (void)drain_logs_and_refresh(el);
-      
+
       // Terminate read now if we're stopping or reconnecting
       if (g_stop.load(std::memory_order_relaxed) || g_reconnect.load(std::memory_order_relaxed)) return 0;
-      
+
       continue;
     }
 
@@ -1717,39 +1727,18 @@ static int my_getc(EditLine* el, char* c) {
 	  g_stop.store(true, std::memory_order_relaxed);
 	  return 0; // el_gets() sees EOF
 	}
-	if (*c == 3) { // Ctrl-C -> treat as EOF to avoid redraw
-	  g_stop.store(true, std::memory_order_relaxed);
-	  std::fputs("\n", stdout);  // drop the current line cleanly
-	  std::fflush(stdout);
-	  return 0; // el_gets() sees EOF and exits immediately
-	}
-	if (*c == 27) { // ESC pressed at prompt -> exit shell (unless part of escape sequence)
-	  bool escape_alone = true;
-	  struct pollfd esc_fd{STDIN_FILENO, POLLIN, 0};
-	  while (true) {
-	    int pr = poll(&esc_fd, 1, 30);
-	    if (pr < 0) {
-	      if (errno == EINTR) continue;
-	      break; // treat as lone ESC on error
-	    }
-	    if (pr == 0) {
-	      break; // no extra byte -> lone ESC
-	    }
-	    if (esc_fd.revents & POLLIN) {
-	      escape_alone = false;
-	    }
-	    break;
-	  }
-	  if (escape_alone) {
-	    g_stop.store(true, std::memory_order_relaxed);
-	    std::fputs("\n", stdout);
-	    std::fflush(stdout);
-	    return 0;
-	  }
+	if (*c == 3) { // Ctrl-C -> cancel current input line
+	  tcflush(STDIN_FILENO, TCIFLUSH);
+	  el_reset(el);
+	  *c = '\n';
+	  return 1;
 	}
 	return 1;
       }
-      if (n == 0)  return 0;          // EOF
+      if (n == 0) {
+	g_stop.store(true, std::memory_order_relaxed);
+	return 0;          // EOF
+      }
       if (errno == EINTR) continue;
       return -1;                      // error
     }
@@ -1759,9 +1748,13 @@ static int my_getc(EditLine* el, char* c) {
 // ----------------------------
 // Signals
 // ----------------------------
-static void signal_handler(int) {
-  g_stop.store(true, std::memory_order_relaxed);
-  // Nudge the REPL so my_getc() exits promptly
+static void signal_handler(int sig) {
+  if (sig == SIGINT && g_repl_active.load(std::memory_order_relaxed)) {
+    g_sigint_requested.store(true, std::memory_order_relaxed);
+  } else {
+    g_stop.store(true, std::memory_order_relaxed);
+  }
+  // Nudge the REPL/input loop so my_getc() notices the change promptly
   if (g_wake_pipe[1] != -1) { char x = 0; (void)!write(g_wake_pipe[1], &x, 1); }
 }
 

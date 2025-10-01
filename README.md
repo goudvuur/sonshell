@@ -58,7 +58,7 @@ Once connected you drop into the **SonShell** prompt. Every command below is ava
 | `record start` | Begin movie recording (simulates the camera's record button). |
 | `record stop` | Stop movie recording; warns if the camera stays in the recording state. |
 | `poweroff` | Send the camera a power-off command. |
-| `quit`, `exit` | Leave the shell and terminate the program. Shortcut: **ESC**. |
+| `quit`, `exit` | Leave the shell and terminate the program. |
 
 Additional shortcuts: press **ESC/Q** while the monitor window is focused to stop live-view, press **ESC** at the prompt to quit the shell, and use **Ctrl+C** or **Ctrl+D** to exit cleanly as well.
 
