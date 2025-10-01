@@ -1057,6 +1057,28 @@ static bool exposure_error_suggests_mode_change(SDK::CrError err) {
   return false;
 }
 
+static void log_command_overview() {
+  LOGI("SonShell commands:");
+  LOGI("  help                 Show this command overview");
+  LOGI("  status               Dump a snapshot of camera settings (mode, ISO, lens, etc.)");
+  LOGI("  exposure ...         Inspect or set exposure options; run 'exposure' for subcommands");
+  LOGI("  shoot | trigger      Fire the shutter immediately (full press)");
+  LOGI("  focus                Half-press + release to autofocus");
+  LOGI("  sync [N|all|on|off]  Pull the latest files or mirror all contents; 'sync stop' aborts");
+  LOGI("  monitor start|stop   Start/stop the live-view window (requires OpenCV deps)");
+  LOGI("  record start|stop    Toggle movie recording");
+  LOGI("  poweroff             Ask the camera to power down (half-pressing the shutter will wake it up)");
+  LOGI("  quit | exit          Leave SonShell");
+  LOGI("Shortcuts:");
+  LOGI("  Ctrl+C               Cancel the current line and show a fresh prompt");
+  LOGI("  Ctrl+D               Quit the shell (same as 'exit')");
+  LOGI("  F1 / 'trigger'       Fire shutter (mapped by the REPL)");
+  LOGI("Notes:");
+  LOGI("  Use '--dir' at launch to pick a download folder; '--cmd' runs a hook per file");
+  LOGI("  Auto-download can be toggled at runtime with 'sync on' / 'sync off'");
+  LOGI("  Some exposure controls require the camera's physical mode dial to match");
+}
+
 static void log_exposure_usage() {
   LOGI("usage: exposure <show|mode|iso|aperture|shutter|comp>");
   LOGI("  show                 Display current exposure metrics");
@@ -2726,6 +2748,14 @@ int main(int argc, char **argv) {
       Context ctx;
       using Handler = std::function<int(const std::vector<std::string>&)>;
       std::unordered_map<std::string, Handler> cmd{
+	{"help", [&](auto const& args)->int {
+	  (void)args;
+	  log_command_overview();
+	  return 0;
+	}},
+	{"?",   [&](auto const& args)->int {
+	  return cmd.at("help")(args);
+	}},
 	{"shoot", [&](auto const& args)->int {
 	  //if (args.size() < 2) { std::cerr << "usage: connect <host>\n"; return 2; }
 	  ctx.handle = handle;
