@@ -1067,7 +1067,7 @@ static void log_command_overview() {
   LOGI("  sync [N|all|on|off]  Pull the latest files or mirror all contents; 'sync stop' aborts");
   LOGI("  monitor start|stop   Start/stop the live-view window (requires OpenCV deps)");
   LOGI("  record start|stop    Toggle movie recording");
-  LOGI("  poweroff             Ask the camera to power down (half-pressing the shutter will wake it up)");
+  LOGI("  power off            Ask the camera to power down (half-pressing the shutter will wake it up)");
   LOGI("  quit | exit          Leave SonShell");
   LOGI("Shortcuts:");
   LOGI("  Ctrl+C               Cancel the current line and show a fresh prompt");
@@ -2583,7 +2583,7 @@ static void disconnect_and_release(SDK::CrDeviceHandle &handle,
 
 // simple word list
 static const std::vector<std::string> commands = {
-  "shoot", "trigger", "focus", "sync", "monitor", "record", "status", "exposure", "poweroff", "quit", "exit"
+  "shoot", "trigger", "focus", "sync", "monitor", "record", "status", "exposure", "power", "quit", "exit"
 };
 
 char* prompt(EditLine*) {
@@ -3116,8 +3116,17 @@ int main(int argc, char **argv) {
 	  LOGE("usage: monitor start|stop");
 	  return 2;
 	}},
-	{"poweroff", [&](auto const& args)->int {
-	  (void)args;
+	{"power", [&](auto const& args)->int {
+	  if (args.size() < 2) {
+	    LOGE("usage: power off");
+	    return 2;
+	  }
+	  std::string sub = args[1];
+	  std::transform(sub.begin(), sub.end(), sub.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	  if (sub != "off") {
+	    LOGE("power: unknown subcommand '" << sub << "'; try 'power off'.");
+	    return 2;
+	  }
 	  if (!handle) {
 	    LOGE("Camera handle not available; cannot power off.");
 	    return 2;

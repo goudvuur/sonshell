@@ -1,7 +1,8 @@
 # SonShell - an effort to "ssh into my Sony camera"
 
-A Linux-only helper built on Sony’s official **Camera Remote SDK**.
-It connects to a Sony A6700 camera over Wi-Fi/Ethernet, listens for new photos, downloads them automatically, and can optionally run a script on each downloaded file.
+A Linux-only helper built on Sony’s official **Camera Remote SDK**. It connects to a Sony A6700 (and other supported bodies) over Wi-Fi or Ethernet, mirrors new captures straight to your workstation, and drops you into an interactive shell for remote control.
+
+The shell can download files automatically, trigger the shutter, tweak exposure settings, start live view, run post-download hooks, and keep retrying if the camera drops offline. Everything runs from a single terminal window.
 
 ---
 
@@ -11,87 +12,121 @@ https://github.com/user-attachments/assets/6146ff3b-d51c-412b-8684-bdde5c418d4d
 
 ---
 
-## Features
-- Auto-connect via **enumeration** or **direct IP/MAC**.
-- Watches for new capture events and fetches the newest files.
-- Saves into a chosen directory with **unique filenames**.
-- **Post-download hook**: run any executable/script with the saved file path as argument.
-- **Keepalive mode**: auto-retry on startup failure or after disconnects.
-- Linux-only
+## Quick Start
 
----
+### Requirements
+- Linux (developed on Ubuntu 24.04) with a C++17 toolchain (`gcc`, `g++`, `cmake`, `make`).
+- Sony Camera Remote SDK v2.00.00 (the zips live under `docs/`; extract them somewhere convenient).
+- Python 3 for the small header-generation scripts.
+- Runtime deps: libedit, ncurses, libudev, libxml2, OpenCV 4.8 (bundled inside Sony’s SDK).
 
-## Usage
+On Ubuntu/Debian you can grab the basics with:
 ```bash
-./sonshell --dir /photos [options]
+sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-dev libedit-dev python3
 ```
 
-## Options
-- `--dir <path>` : Directory to save files (required in most real setups).
-- `--ip <addr>` : Connect directly by IPv4 (e.g. `192.168.1.1`).
-- `--mac <hex:mac>` : Optional MAC (e.g. `10:20:30:40:50:60`) for direct IP.
-- `--cmd <path>` : Executable/script to run after each download, invoked as `cmd /photos/DSC01234.JPG`
-- `--keepalive <ms>` : Retry interval when offline or after disconnect.
-- `--verbose` : Verbose property-change logging.
-- `--user <name>` : Supply username for access-auth cameras.
-- `--pass <pass>` : Supply password for access-auth cameras.
+### Build in a hurry
+1. Pick an extract point for the SDK (example below keeps it inside this repo):
+   ```bash
+   unzip docs/CrSDK_v2.00.00_api.zip -d docs/CrSDK_api   # skip if already unpacked
+   export SONY_SDK_DIR="$PWD/docs/CrSDK_api/CRSDK"   # points at the folder that contains 'app/'
+   ```
+2. Configure CMake and prepare the generated-header folder:
+   ```bash
+   cmake -S . -B build -DSONY_SDK_DIR="$SONY_SDK_DIR"
+   cmake -E make_directory build/gen
+   ```
+3. Generate the lookup tables that pretty-print SDK enums:
+   ```bash
+   python3 tools/gen_prop_names.py --header "${SONY_SDK_DIR}/app/CRSDK/CrDeviceProperty.h" -o build/gen/prop_names_generated.h
+   python3 tools/gen_error_names.py --header "${SONY_SDK_DIR}/app/CRSDK/CrError.h" -o build/gen/error_names_generated.h
+   ```
+4. Compile and copy the required Sony/OpenCV shared libraries next to the binary:
+   ```bash
+   cmake --build build --config Release
+   ```
+5. Run it (start with enumeration and let SonShell pick the download folder):
+   ```bash
+   ./build/sonshell --dir "$PWD/photos" --keepalive 3000
+   ```
+
+The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `build/`. Run the binary from inside `build/` (or keep the copied `.so` files alongside it) so live view keeps working.
 
 ---
 
-## Interactive Commands
+## Command-Line Options
 
-Once connected you drop into the **SonShell** prompt. Every command below is available at the REPL:
-
-| Command | Description |
+| Option | Description |
 | --- | --- |
-| `shoot` | Fire the shutter (full press). Shortcut: **F1**. |
-| `trigger` | Alias for `shoot`. Shortcut: **F1**. |
-| `focus` | Half-press the shutter to autofocus, then release. |
-| `sync <N>` | Download the most recent `N` items from each slot (skips existing files). |
-| `sync all` | Mirror every item from both slots to the download directory. |
-| `sync stop` | Gracefully cancel an in-progress sync after the current file finishes. |
-| `sync on` | Resume automatic downloads triggered by new captures (default). |
-| `sync off` | Pause automatic downloads triggered by new captures. |
-| `status` | Show current exposure, focus, and media settings reported by the camera. |
-| `monitor start` | Launch the live-view window; closes automatically when you close the window or run `monitor stop`. |
-| `monitor stop` | Stop live-view streaming and close the OpenCV window. |
-| `record start` | Begin movie recording (simulates the camera's record button). |
-| `record stop` | Stop movie recording; warns if the camera stays in the recording state. |
-| `poweroff` | Send the camera a power-off command. |
-| `quit`, `exit` | Leave the shell and terminate the program. |
+| `--dir <path>` | Directory where downloads are stored. If omitted, files land in the working directory; providing an explicit folder is strongly recommended for sync features. |
+| `--ip <addr>` | Connect directly to a camera at the given IPv4 address (e.g. `192.168.1.1`). Skipped when enumerating automatically. |
+| `--mac <hex:mac>` | Optional MAC address for direct-IP connects (`aa:bb:cc:dd:ee:ff`). Used to seed the SDK’s Ethernet object. |
+| `--user <name>` | Username for cameras with Access Auth enabled. |
+| `--pass <password>` | Password for Access Auth. Combine with `--user`. |
+| `--cmd <path>` | Executable/script to run after each successful download. Receives the saved file path and runs asynchronously (SonShell does not wait for it to finish). |
+| `--keepalive <ms>` | Reconnection delay after failure or disconnect. `0` disables retry (SonShell exits on error). |
+| `--verbose`, `-v` | Print detailed property-change logs and transfer progress from the SDK callbacks. |
 
-Additional shortcuts: press **ESC/Q** while the monitor window is focused to stop live-view, press **ESC** at the prompt to quit the shell, and use **Ctrl+C** or **Ctrl+D** to exit cleanly as well.
-
-
-## Examples
-Enumerate + keep retrying every 2s, run a hook after each file:
-```bash
-./sonshell --dir /tmp/photos --verbose --keepalive 3000 --cmd ../scripts/show_single.sh
-```
-
-Direct IP connect, verbose logs, retry every 3s:
-```bash
-./sonshell --ip 192.168.1.1 --mac 10:20:30:40:50:60 --dir /tmp/photos -v --keepalive 3000
-```
+If no `--ip` is provided SonShell enumerates available cameras and uses the first match. A fingerprint of the successful connection is cached under `~/.cache/sonshell/fp_enumerated.bin` so subsequent launches pair faster.
 
 ---
 
-## Build
-Requires Linux, g++, and the Sony Camera Remote SDK.
+## Shell Command Reference
 
-See [INSTALL.md](./INSTALL.md)
+| Command | Variants / Subcommands | What it does | Shortcut |
+| --- | --- | --- | --- |
+| `help`, `?` | – | Print the built-in overview of available commands. | – |
+| `status` | – | Snapshot the body/lens info plus exposure, focus, and movie settings (`StatusSnapshot`). | – |
+| `shoot`, `trigger` | – | Full-press the shutter (locks S1, fires, releases). | `F1` (mapped in the REPL) |
+| `focus` | – | Half-press S1 long enough to autofocus, then release. | – |
+| `sync` | `sync`, `sync <N>`, `sync all`, `sync on`, `sync off`, `sync stop` | `sync`/`sync <N>` downloads the newest `N` items per slot (skips existing files). `sync all` mirrors every item, preserving Sony’s DCIM/day folder layout. `sync on/off` toggles automatic downloads triggered by new captures. `sync stop` cancels an active sync after the current file finishes (sends `CancelContentsTransfer` when the body supports it). | – |
+| `exposure` | `exposure show`, `mode <value>`, `iso <value>`, `aperture <f-number>`, `shutter <value>`, `comp <value>` (aliases: `sensitivity`, `f`, `fnumber`, `speed`, `compensation`, `ev`) | Inspect or change exposure parameters. Values accept friendly forms like `manual`, `auto`, `f/2.8`, `1/125`, `0.3`, or `1/3`. SonShell surfaces hints when the camera mode dial must change. | – |
+| `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close by running `monitor stop` or pressing `Esc`/`q` while the window is focused. | `Esc`/`q` in the window |
+| `record` | `record start`, `record stop` | Toggle movie recording (simulates the camera’s red button). Confirms state when possible. | – |
+| `power` | `power off` | Request a remote power-down. Enable “Remote Power OFF/ON” plus “Network Standby” on the camera for best results. | – |
+| `quit`, `exit` | – | Leave SonShell. Also triggered by `Ctrl+D` or pressing `Esc` at an empty prompt. | `Ctrl+D`, `Esc` |
+
+Automatic downloads queue in worker threads. Newly captured files are renamed to avoid clashes (e.g. `DSC01234.JPG`, `DSC01234_1.JPG`, …) unless you run a manual `sync`, in which case the original names and folder layout are preserved.
 
 ---
 
-## How It Works
-1. **Connect** to the camera (via IP or enumeration).
-   Stores/reuses SDK **fingerprint** under `~/.cache/sonshell/`.
-2. **Wait for notifications**: when the camera signals new contents,
-   spawn a download thread.
-3. **Download** newest files to `--dir`.
-   Safe naming ensures no overwrite (`file_1.jpg`, etc.).
-4. **Hook**: if `--cmd` is set, fork/exec the script with the saved path.
-5. **Reconnect** on errors/disconnects if `--keepalive` is set.
+## Keyboard Shortcuts
+- `F1` inside the REPL: triggers `shoot` (full shutter press).
+- `Ctrl+C`: cancel the current input line and repaint the prompt immediately.
+- `Ctrl+D`: exit the shell (same as `quit`).
+- `Esc` at an empty prompt: exit the shell.
+- `Esc` or `q` while the live-view window is focused: stop live view.
+
+---
+
+## Features
+- Auto-connect via enumeration or direct IP, with fingerprint caching under `~/.cache/sonshell/` and optional username/password for Access Auth bodies.
+- Automatic download of new captures with unique local filenames plus manual `sync` flows (`latest N` or full mirror).
+- Post-download hook (`--cmd`) for chaining image pipelines or notifications.
+- Exposure control commands that wrap Sony’s SDK properties, including helpful mode hints when the body rejects a setting.
+- Live-view streaming implemented with the SDK monitor APIs and bundled OpenCV 4.8 binaries.
+- Robust REPL built on libedit: asynchronous logging, history persisted to `~/.cache/sonshell/history`, and key bindings for shutter control.
+- Keepalive loop (`--keepalive`) that retries connections without manual intervention.
+- Clean shutdown handling: SIGINT/SIGTERM set a global stop flag, downloads wind down gracefully, and the SDK is released once background threads exit.
+
+---
+
+## How It’s Built
+- Single translation unit (`src/main.cpp`) stitches together the SDK callback interface, the REPL, and async transfer logic.
+- `QuietCallback` implements `SDK::IDeviceCallback`, dispatching transfers, aggregating progress, and feeding a log queue so the shell stays responsive.
+- A background input thread owns libedit; download work happens in detached worker threads; live view runs in its own thread guarded by `g_monitor_mtx`.
+- Generated helper headers – `prop_names_generated.h` and `error_names_generated.h` – are produced by the Python scripts in `tools/` using Sony’s official headers so logs can spell out property/error names.
+- CMake links directly against `libCr_Core.so`, `libCr_PTP_IP.so`, and Sony’s OpenCV libs, then copies those `.so` files into the build output so `./build/sonshell` runs without extra `LD_LIBRARY_PATH` tweaking.
+- Persistent state (fingerprint, REPL history) lives under `~/.cache/sonshell/` and is recreated on demand.
+
+---
+
+## Bundled SDK Material
+Two Sony-provided archives live under `docs/` for reference:
+- `CrSDK_v2.00.00_api.zip` — the Camera Remote SDK headers and binaries (used for building SonShell).
+- `CrSDK_v2.00.00_app.zip` — Sony’s interactive sample application; handy for comparing behaviour or diagnosing SDK issues.
+
+You can keep them compressed or extract them alongside the project; just point `SONY_SDK_DIR` at the unpacked API archive when configuring the build.
 
 ---
 
@@ -110,44 +145,3 @@ See [LICENSE](./LICENSE) for licensing details.
 - Sony Camera Remote SDK: https://support.d-imaging.sony.co.jp/app/sdk/en/index.html
 
 ---
-
-## Developer Documentation
-
-### Notes
-- Built on/for Ubuntu 24.04
-- It uses Sony's official Camera Remote SDK (not included here).
-- I leaned heavily on ChatGPT while creating this, so please don't mind the mess! ;)
-
-### Architecture
-- Interactive REPL shell using libedit, with a custom getchar (`my_getc`) that integrates log-draining and prompt refresh.
-- Separate background threads:
-  - **Input thread** (REPL) handles user commands.
-  - **Download workers** handle file transfers.
-  - **Wake pipe** mechanism used to wake REPL for new logs without clobbering the prompt.
-
-### Sync Implementation
-- `sync <N>`: downloads the last N files per slot.
-- `sync all`: downloads *all* files from the camera, preserving the DCIM/day-folder structure.
-- `sync stop`: aborts an in-progress sync gracefully (after the current file finishes).
-- Sync skips files already present locally.
-
-### Logging
-- Each file transfer produces a single compact `[PHOTO] filename (bytes, ms)` log line.
-- For large files, intermediate progress updates are logged.
-- Verbosity can be toggled with `--verbose`.
-
-### Shutdown Handling
-- Ctrl-C and Ctrl-D are fixed to exit cleanly on the first press, without requiring repeats.
-- Signal handler sets `g_stop` and nudges the wake pipe so the REPL loop exits immediately.
-- Input thread is joined before disconnect, preventing stray prompt redraws.
-
-### Authentication
-- New `--user` and `--pass` options allow supplying credentials if the camera has **Access Auth** enabled.
-- Fingerprint caching (`~/.cache/sonshell/fp_enumerated.bin`) stays empty if Access Auth is disabled — this is expected.
-
-### Recent Changes
-- Added sync commands (`sync <N>`, `sync all`, `sync stop`).
-- Folder mirroring when syncing.
-- Improved logging format (single `[PHOTO]` line per file).
-- Fixed Ctrl-C / Ctrl-D handling.
-- Added `--user` / `--pass` options for authentication.
