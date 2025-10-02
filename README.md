@@ -80,7 +80,7 @@ If no `--ip` is provided SonShell enumerates available cameras and uses the firs
 | `focus` | – | Half-press S1 long enough to autofocus, then release. | – |
 | `sync` | `sync`, `sync <N>`, `sync all`, `sync on`, `sync off`, `sync stop` | `sync`/`sync <N>` downloads the newest `N` items per slot (skips existing files). `sync all` mirrors every item, preserving Sony’s DCIM/day folder layout. `sync on/off` toggles automatic downloads triggered by new captures. `sync stop` cancels an active sync after the current file finishes (sends `CancelContentsTransfer` when the body supports it). | – |
 | `exposure` | `exposure show`, `mode <value>`, `iso <value>`, `aperture <f-number>`, `shutter <value>`, `comp <value>` (aliases: `sensitivity`, `f`, `fnumber`, `speed`, `compensation`, `ev`) | Inspect or change exposure parameters. Values accept friendly forms like `manual`, `auto`, `f/2.8`, `1/125`, `0.3`, or `1/3`. SonShell surfaces hints when the camera mode dial must change. | – |
-| `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close by running `monitor stop` or pressing `q` while the window is focused. | `q` in the window |
+| `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close it with `monitor stop`. | – |
 | `record` | `record start`, `record stop` | Toggle movie recording (simulates the camera’s red button). Confirms state when possible. | – |
 | `power` | `power off` | Request a remote power-down. Enable “Remote Power OFF/ON” plus “Network Standby” on the camera for best results. | – |
 | `quit`, `exit` | – | Leave SonShell. Also triggered by `Ctrl+D`. | `Ctrl+D` |
@@ -93,7 +93,6 @@ Automatic downloads queue in worker threads. Newly captured files are renamed to
 - `F1` inside the REPL: triggers `shoot` (full shutter press).
 - `Ctrl+C`: cancel the current input line and repaint the prompt immediately.
 - `Ctrl+D`: exit the shell (same as `quit`).
-- `q` while the live-view window is focused: stop live view.
 
 ---
 

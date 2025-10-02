@@ -1607,10 +1607,7 @@ static void monitor_thread_main(SDK::CrDeviceHandle handle, bool verbose) {
     }
 
     int key = cv::waitKey(1);
-    if (key == 27 || key == 'q' || key == 'Q') {
-      g_monitor_stop_flag.store(true, std::memory_order_release);
-      break;
-    }
+    (void)key;  // reserved for future hotkeys; keep calling waitKey to pump events
 
   }
 
@@ -1666,7 +1663,7 @@ static bool monitor_start(SDK::CrDeviceHandle handle, bool verbose) {
     return false;
   }
 
-  LOGI("[monitor] started (press ESC in the window or run 'monitor stop')");
+  LOGI("[monitor] started (run 'monitor stop' to close the window)");
   return true;
 }
 
