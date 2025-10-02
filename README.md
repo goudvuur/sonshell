@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/6146ff3b-d51c-412b-8684-bdde5c418d4d
 
 ### Requirements
 - Linux (developed on Ubuntu 24.04) with a C++17 toolchain (`gcc`, `g++`, `cmake`, `make`).
-- Sony Camera Remote SDK v2.00.00 (the zips live under `docs/`; extract them somewhere convenient).
+- Sony Camera Remote SDK v2.00.00 (download it from Sony and extract it somewhere convenient).
 - Python 3 for the small header-generation scripts.
 - Runtime deps: libedit, ncurses, libudev, libxml2, OpenCV 4.8 (bundled inside Sony’s SDK).
 
@@ -26,10 +26,9 @@ sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-d
 ```
 
 ### Build in a hurry
-1. Pick an extract point for the SDK (example below keeps it inside this repo):
+1. Download and extract the Sony Camera Remote SDK v2.00.00, then point `SONY_SDK_DIR` at the folder that contains `app/` (example path shown below):
    ```bash
-   unzip docs/CrSDK_v2.00.00_api.zip -d docs/CrSDK_api   # skip if already unpacked
-   export SONY_SDK_DIR="$PWD/docs/CrSDK_api/CRSDK"   # points at the folder that contains 'app/'
+   export SONY_SDK_DIR="$HOME/SonySDK/CrSDK_v2.00.00/CRSDK"
    ```
 2. Configure CMake and prepare the generated-header folder:
    ```bash
@@ -81,10 +80,10 @@ If no `--ip` is provided SonShell enumerates available cameras and uses the firs
 | `focus` | – | Half-press S1 long enough to autofocus, then release. | – |
 | `sync` | `sync`, `sync <N>`, `sync all`, `sync on`, `sync off`, `sync stop` | `sync`/`sync <N>` downloads the newest `N` items per slot (skips existing files). `sync all` mirrors every item, preserving Sony’s DCIM/day folder layout. `sync on/off` toggles automatic downloads triggered by new captures. `sync stop` cancels an active sync after the current file finishes (sends `CancelContentsTransfer` when the body supports it). | – |
 | `exposure` | `exposure show`, `mode <value>`, `iso <value>`, `aperture <f-number>`, `shutter <value>`, `comp <value>` (aliases: `sensitivity`, `f`, `fnumber`, `speed`, `compensation`, `ev`) | Inspect or change exposure parameters. Values accept friendly forms like `manual`, `auto`, `f/2.8`, `1/125`, `0.3`, or `1/3`. SonShell surfaces hints when the camera mode dial must change. | – |
-| `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close by running `monitor stop` or pressing `Esc`/`q` while the window is focused. | `Esc`/`q` in the window |
+| `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close by running `monitor stop` or pressing `q` while the window is focused. | `q` in the window |
 | `record` | `record start`, `record stop` | Toggle movie recording (simulates the camera’s red button). Confirms state when possible. | – |
 | `power` | `power off` | Request a remote power-down. Enable “Remote Power OFF/ON” plus “Network Standby” on the camera for best results. | – |
-| `quit`, `exit` | – | Leave SonShell. Also triggered by `Ctrl+D` or pressing `Esc` at an empty prompt. | `Ctrl+D`, `Esc` |
+| `quit`, `exit` | – | Leave SonShell. Also triggered by `Ctrl+D`. | `Ctrl+D` |
 
 Automatic downloads queue in worker threads. Newly captured files are renamed to avoid clashes (e.g. `DSC01234.JPG`, `DSC01234_1.JPG`, …) unless you run a manual `sync`, in which case the original names and folder layout are preserved.
 
@@ -94,8 +93,7 @@ Automatic downloads queue in worker threads. Newly captured files are renamed to
 - `F1` inside the REPL: triggers `shoot` (full shutter press).
 - `Ctrl+C`: cancel the current input line and repaint the prompt immediately.
 - `Ctrl+D`: exit the shell (same as `quit`).
-- `Esc` at an empty prompt: exit the shell.
-- `Esc` or `q` while the live-view window is focused: stop live view.
+- `q` while the live-view window is focused: stop live view.
 
 ---
 
@@ -118,15 +116,6 @@ Automatic downloads queue in worker threads. Newly captured files are renamed to
 - Generated helper headers – `prop_names_generated.h` and `error_names_generated.h` – are produced by the Python scripts in `tools/` using Sony’s official headers so logs can spell out property/error names.
 - CMake links directly against `libCr_Core.so`, `libCr_PTP_IP.so`, and Sony’s OpenCV libs, then copies those `.so` files into the build output so `./build/sonshell` runs without extra `LD_LIBRARY_PATH` tweaking.
 - Persistent state (fingerprint, REPL history) lives under `~/.cache/sonshell/` and is recreated on demand.
-
----
-
-## Bundled SDK Material
-Two Sony-provided archives live under `docs/` for reference:
-- `CrSDK_v2.00.00_api.zip` — the Camera Remote SDK headers and binaries (used for building SonShell).
-- `CrSDK_v2.00.00_app.zip` — Sony’s interactive sample application; handy for comparing behaviour or diagnosing SDK issues.
-
-You can keep them compressed or extract them alongside the project; just point `SONY_SDK_DIR` at the unpacked API archive when configuring the build.
 
 ---
 
