@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Join all arguments into a single message string
-msg="SonShell debug script.\nArgs: $*\n$1"
+msg="SonShell debug script.\nArgs: $*"
 
 if command -v kdialog >/dev/null; then
     kdialog --msgbox "$msg"

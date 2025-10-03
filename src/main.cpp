@@ -81,6 +81,10 @@ static std::thread       g_monitor_thread;
 static std::atomic<bool> g_monitor_running{false};
 static std::atomic<bool> g_monitor_stop_flag{false};
 static constexpr const char* kMonitorWindowName = "sonshell-monitor";
+static std::atomic<std::uint64_t> g_last_contents_update_slot1{0};
+static std::atomic<std::uint64_t> g_last_contents_update_slot2{0};
+static std::mutex g_rating_mtx;
+static std::unordered_map<std::uint64_t, int> g_last_known_ratings;
 
 static const char* camera_power_status_to_string(SDK::CrCameraPowerStatus status) {
   switch (status) {
@@ -121,6 +125,136 @@ static const char* movie_recording_state_to_string(SDK::CrMovie_Recording_State 
     default: return "Unknown";
   }
 }
+
+static const char* camera_button_function_status_to_string(CrInt16u status) {
+  switch (status) {
+    case SDK::CrCameraButtonFunctionStatus_Idle: return "Idle";
+    case SDK::CrCameraButtonFunctionStatus_AnyKeyOn: return "AnyKeyOn";
+    default: return "Unknown";
+  }
+}
+
+static int contents_rating_to_int(SDK::CrContentsInfo_Rating rating) {
+  switch (rating) {
+    case SDK::CrContentsInfo_Rating_NotRequired: return -1;
+    case SDK::CrContentsInfo_Rating_Nothing: return 0;
+    case SDK::CrContentsInfo_Rating_1: return 1;
+    case SDK::CrContentsInfo_Rating_2: return 2;
+    case SDK::CrContentsInfo_Rating_3: return 3;
+    case SDK::CrContentsInfo_Rating_4: return 4;
+    case SDK::CrContentsInfo_Rating_5: return 5;
+    default: return -1;
+  }
+}
+
+static std::string contents_rating_to_string(SDK::CrContentsInfo_Rating rating) {
+  switch (rating) {
+    case SDK::CrContentsInfo_Rating_NotRequired: return "NotRequired";
+    case SDK::CrContentsInfo_Rating_Nothing: return "0";
+    case SDK::CrContentsInfo_Rating_1: return "1";
+    case SDK::CrContentsInfo_Rating_2: return "2";
+    case SDK::CrContentsInfo_Rating_3: return "3";
+    case SDK::CrContentsInfo_Rating_4: return "4";
+    case SDK::CrContentsInfo_Rating_5: return "5";
+    default: return "Unknown";
+  }
+}
+
+static bool capture_date_equal(const SDK::CrCaptureDate &a,
+                               const SDK::CrCaptureDate &b) {
+  return a.year == b.year && a.month == b.month && a.day == b.day &&
+         a.hour == b.hour && a.minute == b.minute && a.sec == b.sec &&
+         a.msec == b.msec;
+}
+
+static bool capture_date_newer(const SDK::CrCaptureDate &a,
+                               const SDK::CrCaptureDate &b) {
+  if (a.year != b.year) return a.year > b.year;
+  if (a.month != b.month) return a.month > b.month;
+  if (a.day != b.day) return a.day > b.day;
+  if (a.hour != b.hour) return a.hour > b.hour;
+  if (a.minute != b.minute) return a.minute > b.minute;
+  if (a.sec != b.sec) return a.sec > b.sec;
+  return a.msec > b.msec;
+}
+
+static std::string camera_mode_to_string(int mode_value) {
+  switch (mode_value) {
+    case SDK::CrCameraOperatingMode_Record: return "record";
+    case SDK::CrCameraOperatingMode_Playback: return "playback";
+    default: {
+      std::ostringstream oss;
+      oss << "mode_0x" << std::hex << std::uppercase << mode_value;
+      return oss.str();
+    }
+  }
+}
+
+static std::string movie_mode_to_string(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrMovieShootingMode>(static_cast<CrInt16u>(raw));
+  switch (mode) {
+    case SDK::CrMovieShootingMode_Off: return "photo";
+    case SDK::CrMovieShootingMode_CineEI: return "cine_ei";
+    case SDK::CrMovieShootingMode_CineEIQuick: return "cine_ei_quick";
+    case SDK::CrMovieShootingMode_Custom: return "custom";
+    case SDK::CrMovieShootingMode_FlexibleISO: return "flexible_iso";
+    default: {
+      std::ostringstream oss;
+      oss << "movie_0x" << std::hex << std::uppercase << static_cast<CrInt16u>(raw);
+      return oss.str();
+    }
+  }
+}
+
+static std::string sq_mode_token(CrInt64u raw) {
+  auto value = static_cast<SDK::CrSQModeSetting>(static_cast<CrInt8u>(raw & 0xFF));
+  switch (value) {
+    case SDK::CrSQModeSetting_On: return "sq";
+    case SDK::CrSQModeSetting_Off:
+    default:
+      return {};
+  }
+}
+
+static std::string exposure_program_code(CrInt64u raw) {
+  auto mode = static_cast<SDK::CrExposureProgram>(static_cast<CrInt32u>(raw));
+  switch (mode) {
+    case SDK::CrExposure_M_Manual: return "m";
+    case SDK::CrExposure_P_Auto: return "p";
+    case SDK::CrExposure_A_AperturePriority: return "a";
+    case SDK::CrExposure_S_ShutterSpeedPriority: return "s";
+    case SDK::CrExposure_Auto: return "auto";
+    case SDK::CrExposure_Auto_Plus: return "auto_plus";
+    case SDK::CrExposure_Program_Creative: return "creative";
+    case SDK::CrExposure_Program_Action: return "action";
+    case SDK::CrExposure_Portrait: return "portrait";
+    case SDK::CrExposure_Landscape: return "landscape";
+    case SDK::CrExposure_Sports_Action: return "sports";
+    case SDK::CrExposure_Sunset: return "sunset";
+    case SDK::CrExposure_Night: return "night";
+    case SDK::CrExposure_NightPortrait: return "night_portrait";
+    case SDK::CrExposure_Macro: return "macro";
+    case SDK::CrExposure_HandheldTwilight: return "handheld_twilight";
+    case SDK::CrExposure_Pet: return "pet";
+    case SDK::CrExposure_Gourmet: return "gourmet";
+    case SDK::CrExposure_AntiMotionBlur: return "anti_motion_blur";
+    default: {
+      std::ostringstream oss;
+      oss << "exp_0x" << std::hex << std::uppercase << static_cast<CrInt32u>(raw);
+      return oss.str();
+    }
+  }
+}
+
+static bool is_movie_file(const SDK::CrContentsFile &file) {
+  switch (file.fileFormat) {
+    case SDK::CrContentsFile_FileFormat_Mp4:
+      return true;
+    default:
+      return false;
+  }
+}
+
 
 static std::string hex_code(CrInt64u value) {
   std::ostringstream oss;
@@ -704,7 +838,7 @@ static std::string shutter_type_to_string(CrInt64u raw) {
   return hex_code(static_cast<CrInt8u>(raw));
 }
 
-static std::string movie_mode_to_string(CrInt64u raw) {
+static std::string movie_mode_to_display_string(CrInt64u raw) {
   auto mode = static_cast<SDK::CrMovieShootingMode>(static_cast<CrInt16u>(raw));
   switch (mode) {
     case SDK::CrMovieShootingMode_Off: return "Off";
@@ -801,6 +935,74 @@ static PropertyValue fetch_property(SDK::CrDeviceHandle handle, CrInt32u code) {
   return out;
 }
 
+static std::string capture_mode_string(SDK::CrDeviceHandle handle,
+                                       const SDK::CrContentsInfo &info,
+                                       const SDK::CrContentsFile &file) {
+  (void)info;
+  auto mode_prop = fetch_property(handle, SDK::CrDeviceProperty_CameraOperatingMode);
+  int mode_value = mode_prop.supported
+                       ? static_cast<int>(mode_prop.value & 0xFFFF)
+                       : static_cast<int>(SDK::CrCameraOperatingMode_Record);
+  std::string base = camera_mode_to_string(mode_value);
+
+  if (is_movie_file(file)) {
+    std::string detail = "movie";
+    auto movie_mode = fetch_property(handle, SDK::CrDeviceProperty_MovieShootingMode);
+    if (movie_mode.supported) {
+      std::string movie_token = movie_mode_to_string(movie_mode.value);
+      if (!movie_token.empty() && movie_token != "photo") {
+        detail += "/" + movie_token;
+      }
+    }
+    auto sq_mode = fetch_property(handle, SDK::CrDeviceProperty_SQModeSetting);
+    if (sq_mode.supported) {
+      std::string sq = sq_mode_token(sq_mode.value);
+      if (!sq.empty()) detail += "/" + sq;
+    }
+    return base + "/" + detail;
+  }
+
+  std::string detail = "still";
+  auto exposure_mode = fetch_property(handle, SDK::CrDeviceProperty_ExposureProgramMode);
+  if (exposure_mode.supported) {
+    std::string exp_code = exposure_program_code(exposure_mode.value);
+    if (!exp_code.empty()) detail += "/" + exp_code;
+  }
+  return base + "/" + detail;
+}
+
+static std::string current_mode_string(SDK::CrDeviceHandle handle) {
+  auto mode_prop = fetch_property(handle, SDK::CrDeviceProperty_CameraOperatingMode);
+  int mode_value = mode_prop.supported ? static_cast<int>(mode_prop.value & 0xFFFF) : -1;
+  std::string base = camera_mode_to_string(mode_value);
+
+  if (mode_value == SDK::CrCameraOperatingMode_Record) {
+    std::string detail;
+    auto movie_mode = fetch_property(handle, SDK::CrDeviceProperty_MovieShootingMode);
+    if (movie_mode.supported) {
+      std::string movie_token = movie_mode_to_string(movie_mode.value);
+      if (!movie_token.empty() && movie_token != "photo") {
+        detail = movie_token;
+      }
+    }
+
+    auto sq_mode = fetch_property(handle, SDK::CrDeviceProperty_SQModeSetting);
+    if (sq_mode.supported) {
+      std::string sq = sq_mode_token(sq_mode.value);
+      if (!sq.empty()) {
+        if (!detail.empty()) detail += "/" + sq;
+        else detail = sq;
+      }
+    }
+
+    if (!detail.empty() && detail != base) {
+      return base + "/" + detail;
+    }
+  }
+
+  return base;
+}
+
 struct StatusSnapshot {
   std::string model = "--";
   std::string lens = "--";
@@ -864,7 +1066,7 @@ static bool collect_status_snapshot(SDK::CrDeviceHandle handle, StatusSnapshot& 
   assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_Movie_ImageStabilizationSteadyShot, steady_shot_movie_to_string, snap.steady_movie);
   assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_SilentMode, silent_mode_to_string, snap.silent_mode);
   assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_ShutterType, shutter_type_to_string, snap.shutter_type);
-  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_MovieShootingMode, movie_mode_to_string, snap.movie_mode);
+  assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_MovieShootingMode, movie_mode_to_display_string, snap.movie_mode);
   assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_Movie_Recording_Setting, movie_recording_setting_to_string, snap.movie_setting);
   assign_formatted(SDK::CrDevicePropertyCode::CrDeviceProperty_Movie_RecordingMedia, movie_media_to_string, snap.movie_media);
 
@@ -1915,17 +2117,40 @@ static inline void interruptible_sleep(std::chrono::milliseconds total) {
 // ----------------------------
 // Post-download command
 // ----------------------------
-static void run_post_cmd(const std::string &path, const std::string &file) {
+static void run_post_cmd_args(const std::string &path,
+                              const std::vector<std::string> &args) {
   if (path.empty()) return;
 
   pid_t pid = fork();
   if (pid == 0) {
-    // child
-    execl(path.c_str(), path.c_str(), file.c_str(), (char *)nullptr);
-    // If execl fails
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 2);
+    argv.push_back(const_cast<char *>(path.c_str()));
+    for (const auto &arg : args) {
+      argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    execv(path.c_str(), argv.data());
     _exit(127);
   }
   // parent: we don't wait (SIGCHLD is ignored)
+}
+
+static void run_post_cmd(const std::string &path,
+                         const std::string &file,
+                         const std::string &mode,
+                         const std::string &command,
+                         const std::string &old_value = {},
+                         const std::string &new_value = {}) {
+  std::vector<std::string> args{file, mode, command};
+  if (!old_value.empty() || !new_value.empty()) {
+    args.push_back(old_value);
+    if (!new_value.empty()) {
+      args.push_back(new_value);
+    }
+  }
+  run_post_cmd_args(path, args);
 }
 
 class QuietCallback : public SDK::IDeviceCallback {
@@ -1953,6 +2178,8 @@ public:
   std::string dl_current_label; // e.g., "PRIVATE/M4ROOT/CLIP/DSC01234.MP4"
   std::chrono::steady_clock::time_point dl_start_tp{};
   bool dl_any_progress = false;
+  std::string dl_current_mode;
+  std::string dl_current_operation;
   
   void OnConnected(SDK::DeviceConnectionVersioin v) override {
     if (g_shutting_down.load()) return;
@@ -1986,6 +2213,16 @@ public:
     }
   }
 
+  void OnWarningExt(CrInt32u warning, CrInt32 param1, CrInt32 param2, CrInt32 param3) override {
+    if (g_shutting_down.load()) return;
+    LOGI("[CB] OnWarningExt: " << crsdk_err::warning_to_name(warning)
+         << " (0x" << std::hex << warning << std::dec << ")"
+         << " p1=0x" << std::hex << param1
+         << " p2=0x" << param2
+         << " p3=0x" << param3 << std::dec
+         << " | p1=" << param1 << ", p2=" << param2 << ", p3=" << param3);
+  }
+
   void OnError(CrInt32u e) override {
     if (g_shutting_down.load()) return;
     LOGI( "[CB] OnError: " << crsdk_err::error_to_name(e) << " (0x" << std::hex << e << std::dec << ")" );
@@ -2005,14 +2242,26 @@ private:
       CrInt32u code = props[i].GetCode();
       CrInt64u val = props[i].GetCurrentValue();
       auto it = last_prop_vals.find(code);
-      if (it == last_prop_vals.end() || it->second != val) {
-	last_prop_vals[code] = val;
-	if (verbose) {
-	  const char *name = crsdk_util::prop_code_to_name(code);
-      if (verbose) {
-        LOGI( tag << ": " << name << " (0x" << std::hex << code << std::dec << ") -> " << (long long)val );
-      }
-	}
+      bool had_prev = (it != last_prop_vals.end());
+      CrInt64u prev = had_prev ? it->second : 0;
+      if (!had_prev || prev != val) {
+      last_prop_vals[code] = val;
+        if (verbose) {
+          const char *name = crsdk_util::prop_code_to_name(code);
+          std::ostringstream msg;
+          msg << tag << ": " << name << " (0x" << std::hex << code << std::dec << ") -> "
+              << (long long)val;
+          if (had_prev) {
+            msg << " (prev=" << (long long)prev << ')';
+          }
+          LOGI(msg.str());
+        }
+        if (code == SDK::CrDeviceProperty_CameraButtonFunctionStatus) {
+          auto status = static_cast<CrInt16u>(val & 0xFFFF);
+          if (status == SDK::CrCameraButtonFunctionStatus_AnyKeyOn) {
+            schedule_playback_button_job();
+          }
+        }
       }
     }
     SDK::ReleaseDeviceProperties(device_handle, props);
@@ -2026,6 +2275,311 @@ public:
   
   void OnLvPropertyChanged() override {
     if (!g_shutting_down.load()) log_changed_properties_("[CB] OnLvPropertyChanged");
+  }
+
+  void schedule_playback_button_job() {
+    if (g_shutting_down.load()) return;
+    g_downloadThreads.emplace_back([this]() {
+      this->process_playback_button_job();
+    });
+  }
+
+  bool download_single_content_file(SDK::CrSlotNumber slot,
+                                    const SDK::CrContentsInfo &info,
+                                    const SDK::CrContentsFile &file,
+                                    std::string &local_path,
+                                    bool skip_existing) {
+    std::string orig = basename_from_path(file.filePath);
+    if (orig.empty()) {
+      std::ostringstream o;
+      o << "content_" << static_cast<unsigned long long>(info.contentId)
+        << "_file_" << file.fileId;
+      orig = o.str();
+    }
+
+    std::string relDir = dirname_from_path(file.filePath);
+    std::string destDir = g_download_dir;
+    if (!relDir.empty()) {
+      destDir = destDir.empty() ? relDir : join_path(destDir, relDir);
+    }
+
+    std::error_code ec;
+    if (!destDir.empty()) {
+      std::filesystem::create_directories(destDir, ec);
+    }
+
+    std::string finalName = orig;
+    std::string candidatePath = join_path(destDir, finalName);
+    local_path = candidatePath;
+
+    if (skip_existing) {
+      std::error_code exists_ec;
+      if (std::filesystem::exists(candidatePath, exists_ec) && !exists_ec) {
+        return true;
+      }
+    }
+
+    dl_waiting = true;
+    dl_current_label = join_path(relDir, finalName);
+    dl_last_log_per = 101;
+    dl_last_log_tp = std::chrono::steady_clock::now();
+    dl_start_tp = dl_last_log_tp;
+    dl_any_progress = false;
+
+    CrChar *saveDir = destDir.empty()
+                        ? nullptr
+                        : const_cast<CrChar *>(reinterpret_cast<const CrChar *>(destDir.c_str()));
+    CrChar *fileName = const_cast<CrChar *>(reinterpret_cast<const CrChar *>(finalName.c_str()));
+
+    SDK::CrError err = SDK::GetRemoteTransferContentsDataFile(
+        device_handle, slot, info.contentId, file.fileId, 0x1000000,
+        saveDir, fileName);
+    if (err != SDK::CrError_None) {
+      dl_waiting = false;
+      LOGE("GetRemoteTransferContentsDataFile failed: "
+           << crsdk_err::error_to_name(err) << " (0x" << std::hex << err << std::dec << ")");
+      return false;
+    }
+
+    {
+      std::unique_lock<std::mutex> lk(dl_mtx);
+      dl_cv.wait(lk, [&] { return !dl_waiting || g_stop.load(); });
+    }
+
+    if (g_stop.load(std::memory_order_relaxed)) return false;
+
+    if (!last_downloaded_file.empty()) {
+      local_path = last_downloaded_file;
+    }
+    return true;
+  }
+
+  void process_playback_button_job() {
+    if (g_shutting_down.load()) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (g_shutting_down.load()) return;
+    if (!device_handle) return;
+
+    auto playback_mode = fetch_property(device_handle, SDK::CrDeviceProperty_CameraOperatingMode);
+    auto playback_name = fetch_property(device_handle, SDK::CrDeviceProperty_PlaybackContentsName);
+    std::string playback_path = playback_name.text;
+
+    auto playback_media = fetch_property(device_handle, SDK::CrDeviceProperty_PlaybackMedia);
+    SDK::CrSlotNumber slot = SDK::CrSlotNumber_Slot1;
+    if (playback_media.supported &&
+        playback_media.value == SDK::CrPlaybackMedia_Slot2) {
+      slot = SDK::CrSlotNumber_Slot2;
+    }
+
+    CrInt32u update_code = (slot == SDK::CrSlotNumber_Slot2)
+                               ? SDK::CrDeviceProperty_MediaSLOT2_ContentsInfoListUpdateTime
+                               : SDK::CrDeviceProperty_MediaSLOT1_ContentsInfoListUpdateTime;
+
+    auto update_prop = fetch_property(device_handle, update_code);
+    if (!update_prop.supported || update_prop.value == 0) return;
+
+    std::uint64_t update_time = static_cast<std::uint64_t>(update_prop.value);
+    auto &last_update = (slot == SDK::CrSlotNumber_Slot2) ? g_last_contents_update_slot2
+                                                         : g_last_contents_update_slot1;
+
+    if (last_update.load(std::memory_order_relaxed) == update_time) return;
+
+    const int kMaxAttempts = 5;
+    const std::chrono::milliseconds kRetryDelay(200);
+    bool have_initial = false;
+    int initial_rating = 0;
+    std::string local_path;
+    std::string remote_path = playback_path;
+
+    SDK::CrContentsInfo *list = nullptr;
+
+    auto release_list = [&](SDK::CrContentsInfo *&ptr) {
+      if (ptr) {
+        SDK::ReleaseRemoteTransferContentsInfoList(device_handle, ptr);
+        ptr = nullptr;
+      }
+    };
+
+    auto fetch_list = [&](SDK::CrContentsInfo *&out_list, CrInt32u &out_count) -> bool {
+      release_list(out_list);
+      SDK::CrCaptureDate dummy{};
+      SDK::CrError err = SDK::GetRemoteTransferContentsInfoList(
+          device_handle, slot, SDK::CrGetContentsInfoListType_All, &dummy, 0,
+          &out_list, &out_count);
+      if (err != SDK::CrError_None || !out_list || out_count == 0) return false;
+      return true;
+    };
+
+    auto match_file_by_path = [&](const SDK::CrContentsInfo *info) -> const SDK::CrContentsFile * {
+      if (!info) return nullptr;
+      if (playback_path.empty()) return nullptr;
+      for (CrInt32u fi = 0; fi < info->filesNum; ++fi) {
+        const char *fp = reinterpret_cast<const char *>(info->files[fi].filePath);
+        if (!fp) continue;
+        if (playback_path == fp) {
+          return &info->files[fi];
+        }
+      }
+      return nullptr;
+    };
+
+    bool handled = false;
+    for (int attempt = 0; attempt < kMaxAttempts && !g_shutting_down.load(); ++attempt) {
+      CrInt32u count = 0;
+      if (!fetch_list(list, count)) {
+        release_list(list);
+        return;
+      }
+
+      SDK::CrCaptureDate target_stamp(update_time);
+      const SDK::CrContentsInfo *update_info = nullptr;
+      const SDK::CrContentsFile *update_file = nullptr;
+      const SDK::CrContentsInfo *path_info = nullptr;
+      const SDK::CrContentsFile *path_file = nullptr;
+      const SDK::CrContentsInfo *latest_info = nullptr;
+
+      for (CrInt32u i = 0; i < count; ++i) {
+        const SDK::CrContentsInfo &info = list[i];
+        if (!latest_info || capture_date_newer(info.modificationDatetimeUTC,
+                                               latest_info->modificationDatetimeUTC)) {
+          latest_info = &info;
+        }
+
+        const SDK::CrContentsFile *matched = match_file_by_path(&info);
+        if (matched && !path_info) {
+          path_info = &info;
+          path_file = matched;
+        }
+
+        if (update_time != 0 && !update_info &&
+            capture_date_equal(info.modificationDatetimeUTC, target_stamp)) {
+          update_info = &info;
+          update_file = matched;
+          if (!update_file && info.filesNum > 0) {
+            update_file = &info.files[0];
+          }
+        }
+      }
+
+      const SDK::CrContentsInfo *target_info = nullptr;
+      const SDK::CrContentsFile *target_file = nullptr;
+
+      if (path_info) {
+        target_info = path_info;
+        target_file = path_file;
+      }
+      if (update_info) {
+        target_info = update_info;
+        target_file = update_file;
+      }
+      if (!target_info && latest_info) {
+        target_info = latest_info;
+        if (latest_info->filesNum > 0) {
+          target_file = &latest_info->files[0];
+        }
+      }
+
+      if (!target_info || !target_file) {
+        if (attempt + 1 < kMaxAttempts) {
+          std::this_thread::sleep_for(kRetryDelay);
+          continue;
+        }
+        release_list(list);
+        return;
+      }
+
+      std::string match_reason;
+      if (target_info == path_info && path_info && target_info != update_info) {
+        match_reason = "Matched by playback path.";
+      } else if (target_info == update_info && update_info) {
+        match_reason = "Matched by update timestamp.";
+      } else if (target_info == latest_info && latest_info) {
+        match_reason = "Falling back to most recently modified content.";
+      }
+
+      if (target_file->filePath) {
+        remote_path = reinterpret_cast<const char *>(target_file->filePath);
+      }
+
+      int rating_value = contents_rating_to_int(target_info->rating);
+      if (!have_initial) {
+        initial_rating = rating_value;
+        have_initial = true;
+      }
+
+      uint64_t rating_key = (static_cast<uint64_t>(slot) << 32) | target_info->contentId;
+      int prev_rating = 0;
+      bool prev_known = false;
+      {
+        std::lock_guard<std::mutex> lk(g_rating_mtx);
+        auto it = g_last_known_ratings.find(rating_key);
+        if (it != g_last_known_ratings.end()) {
+          prev_rating = it->second;
+          prev_known = true;
+        }
+      }
+
+      bool rating_changed = false;
+      if (prev_known && rating_value != prev_rating) {
+        rating_changed = true;
+      }
+      if (!rating_changed && have_initial && rating_value != initial_rating) {
+        rating_changed = true;
+      }
+
+      if (!rating_changed) {
+        if (attempt + 1 < kMaxAttempts) {
+          std::this_thread::sleep_for(kRetryDelay);
+          continue;
+        }
+        {
+          std::lock_guard<std::mutex> lk(g_rating_mtx);
+          g_last_known_ratings[rating_key] = rating_value;
+        }
+        release_list(list);
+        return;
+      }
+
+      bool have_local = download_single_content_file(slot, *target_info, *target_file,
+                                                     local_path, /*skip_existing=*/true);
+      if (!have_local) {
+        std::error_code exists_ec;
+        if (!local_path.empty() && std::filesystem::exists(local_path, exists_ec) && !exists_ec) {
+          have_local = true;
+        }
+      }
+
+      if (!have_local) {
+        release_list(list);
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lk(g_rating_mtx);
+        g_last_known_ratings[rating_key] = rating_value;
+      }
+
+      if (update_time != 0) {
+        last_update.store(update_time, std::memory_order_relaxed);
+      }
+
+      int mode_value = playback_mode.supported ? static_cast<int>(playback_mode.value & 0xFFFF) : -1;
+      std::string mode_text = camera_mode_to_string(mode_value);
+
+      if (!g_post_cmd.empty() && !local_path.empty()) {
+        std::vector<std::string> args{local_path, mode_text, "rating",
+                                      std::to_string(prev_rating), std::to_string(rating_value)};
+        run_post_cmd_args(g_post_cmd, args);
+      }
+
+      release_list(list);
+      handled = true;
+      break;
+    }
+
+    if (!handled) {
+      release_list(list);
+    }
   }
 
   void OnNotifyRemoteTransferContentsListChanged(CrInt32u notify, CrInt32u slotNumber, CrInt32u addSize) override {
@@ -2121,11 +2675,11 @@ public:
 	      }
 	      
 	      if (g_stop.load(std::memory_order_relaxed)) break;
-	      dl_waiting = true;
-	      CrInt32u fileId = target.files[fi].fileId;
+      dl_waiting = true;
+      CrInt32u fileId = target.files[fi].fileId;
 
-	      // determine original filename
-	      std::string orig = basename_from_path(target.files[fi].filePath);
+      // determine original filename
+      std::string orig = basename_from_path(target.files[fi].filePath);
 	      if (orig.empty()) {
 		std::ostringstream o; o << "content_" << (unsigned long long)target.contentId << "_file_" << fileId;
 		orig = o.str();
@@ -2160,15 +2714,17 @@ public:
 	      
 	      // progress label before SDK gives us the final path
 	      dl_current_label = join_path(relDir, finalName);
-	      dl_last_log_per = 101; // reset throttling so we log 0% immediately
-	      dl_last_log_tp = std::chrono::steady_clock::now();
-	      dl_start_tp = dl_last_log_tp;
-	      dl_any_progress = false;
-	      
-	      // kick off download
-	      SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(
-									 handle, slot, target.contentId, fileId, 0x1000000,
-									 saveDir, const_cast<CrChar *>(finalName.c_str()));
+      dl_last_log_per = 101; // reset throttling so we log 0% immediately
+      dl_last_log_tp = std::chrono::steady_clock::now();
+      dl_start_tp = dl_last_log_tp;
+      dl_any_progress = false;
+      dl_current_operation = is_sync ? "sync" : "new";
+      dl_current_mode = capture_mode_string(device_handle, target, target.files[fi]);
+
+      // kick off download
+      SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(
+								 handle, slot, target.contentId, fileId, 0x1000000,
+								 saveDir, const_cast<CrChar *>(finalName.c_str()));
 
 	      {
 		std::unique_lock<std::mutex> lk(dl_mtx);
@@ -2340,11 +2896,23 @@ public:
       LOGI("[FILE] " << base << " (" << sizeB << " bytes"
            << ", " << elapsed_ms << " ms)");
 
-      if (!g_post_cmd.empty() && !saved.empty()) run_post_cmd(g_post_cmd, saved);
+      if (!g_post_cmd.empty() && !saved.empty()) {
+        std::string mode_text = dl_current_mode.empty()
+                                  ? current_mode_string(device_handle)
+                                  : dl_current_mode;
+        std::string operation = dl_current_operation.empty() ? "new" : dl_current_operation;
+        std::string new_value = dl_current_label.empty() ? base : dl_current_label;
+        run_post_cmd(g_post_cmd, saved, mode_text, operation, "", new_value);
+      }
+
+      dl_current_mode.clear();
+      dl_current_operation.clear();
 
     } else {
       LOGE("[DL] Failed: " << (label.empty() ? "(unknown file)" : label)
 	   << " (notify=0x" << std::hex << notify << std::dec << ")");
+      dl_current_mode.clear();
+      dl_current_operation.clear();
     }
   }
 
