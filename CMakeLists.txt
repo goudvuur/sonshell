@@ -108,6 +108,11 @@ target_link_libraries(sonshell
     dl pthread
 )
 
+# Sony's headers alias CrInt8 to plain `char`, which is unsigned on ARM.
+# Force signed chars so enums with negative values (e.g. CrZoomOperation_Wide)
+# compile consistently across x86_64 and aarch64 toolchains.
+target_compile_options(sonshell PRIVATE -fsigned-char)
+
 # --- Post-build copy helpers -------------------------------------------------
 function(copy_dir_if_exists SRC DST)
   if(EXISTS "${SRC}")
