@@ -26,25 +26,16 @@ sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-d
 ```
 
 ### Build in a hurry
-1. Download and extract the Sony Camera Remote SDK v2.00.00, then point `SONY_SDK_DIR` at the folder that contains `app/` (example path shown below):
+1. Download and extract the Sony Camera Remote SDK v2.00.00, then configure CMake while pointing `SONY_SDK_DIR` at the folder that contains `app/`:
    ```bash
-   export SONY_SDK_DIR="$HOME/SonySDK/CrSDK_v2.00.00_20250805a_Linux64PC"
+   cmake -S . -B build -DSONY_SDK_DIR="$HOME/SonySDK/CrSDK_v2.00.00_20250805a_Linux64PC"
    ```
-2. Configure CMake and prepare the generated-header folder:
-   ```bash
-   cmake -S . -B build -DSONY_SDK_DIR="$SONY_SDK_DIR"
-   cmake -E make_directory build/gen
-   ```
-3. Generate the lookup tables that pretty-print SDK enums:
-   ```bash
-   python3 tools/gen_prop_names.py --header "${SONY_SDK_DIR}/app/CRSDK/CrDeviceProperty.h" -o build/gen/prop_names_generated.h
-   python3 tools/gen_error_names.py --header "${SONY_SDK_DIR}/app/CRSDK/CrError.h" -o build/gen/error_names_generated.h
-   ```
-4. Compile and copy the required Sony/OpenCV shared libraries next to the binary:
+   CMake wires up the Python helpers so the generated lookup headers appear automatically during the first build.
+2. Compile and copy the required Sony/OpenCV shared libraries next to the binary:
    ```bash
    cmake --build build --config Release
    ```
-5. Run it (start with enumeration and let SonShell pick the download folder):
+3. Run it (start with enumeration and let SonShell pick the download folder):
    ```bash
    ./build/sonshell --dir "$PWD/photos" --keepalive 3000
    ```

@@ -18,7 +18,46 @@ include_directories(
   "${CMAKE_BINARY_DIR}/gen"
 )
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+set(GENERATED_DIR "${CMAKE_BINARY_DIR}/gen")
+set(PROP_HEADER   "${SONY_SDK_DIR}/app/CRSDK/CrDeviceProperty.h")
+set(ERROR_HEADER  "${SONY_SDK_DIR}/app/CRSDK/CrError.h")
+
+if(NOT EXISTS "${PROP_HEADER}")
+  message(FATAL_ERROR "Missing required SDK header: ${PROP_HEADER}")
+endif()
+if(NOT EXISTS "${ERROR_HEADER}")
+  message(FATAL_ERROR "Missing required SDK header: ${ERROR_HEADER}")
+endif()
+
+set(PROP_GENERATED  "${GENERATED_DIR}/prop_names_generated.h")
+set(ERROR_GENERATED "${GENERATED_DIR}/error_names_generated.h")
+
+add_custom_command(
+  OUTPUT "${PROP_GENERATED}"
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/gen_prop_names.py"
+          --header "${PROP_HEADER}" -o "${PROP_GENERATED}"
+  DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_prop_names.py" "${PROP_HEADER}"
+  COMMENT "Generating prop_names_generated.h from CrDeviceProperty.h"
+  VERBATIM
+)
+
+add_custom_command(
+  OUTPUT "${ERROR_GENERATED}"
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/gen_error_names.py"
+          --header "${ERROR_HEADER}" -o "${ERROR_GENERATED}"
+  DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_error_names.py" "${ERROR_HEADER}"
+  COMMENT "Generating error_names_generated.h from CrError.h"
+  VERBATIM
+)
+
+add_custom_target(sonshell_generate_sdk_maps
+  DEPENDS "${PROP_GENERATED}" "${ERROR_GENERATED}"
+)
+
 add_executable(sonshell src/main.cpp)
+add_dependencies(sonshell sonshell_generate_sdk_maps)
 
 # --- RPATH / RUNPATH configuration ------------------------------------------
 set(CMAKE_SKIP_BUILD_RPATH FALSE)
