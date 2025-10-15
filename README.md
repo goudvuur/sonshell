@@ -30,7 +30,6 @@ sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-d
    ```bash
    cmake -S . -B build -DSONY_SDK_DIR="$HOME/SonySDK/CrSDK_v2.00.00_20250805a_Linux64PC"
    ```
-   CMake wires up the Python helpers so the generated lookup headers appear automatically during the first build.
 2. Compile and copy the required Sony/OpenCV shared libraries next to the binary:
    ```bash
    cmake --build build --config Release
