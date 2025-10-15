@@ -18,11 +18,12 @@ https://github.com/user-attachments/assets/6146ff3b-d51c-412b-8684-bdde5c418d4d
 - Linux (developed on Ubuntu 24.04) with a C++17 toolchain (`gcc`, `g++`, `cmake`, `make`).
 - Sony Camera Remote SDK v2.00.00 (download it from Sony and extract it somewhere convenient).
 - Python 3 for the small header-generation scripts.
+- `pkg-config` (or `pkgconf`) so CMake can locate GTK when linking Sony’s OpenCV bundle (omit when configuring with `-DSONSHELL_HEADLESS=ON`).
 - Runtime deps: libedit, ncurses, libudev, libxml2, OpenCV 4.8 (bundled inside Sony’s SDK).
 
 On Ubuntu/Debian you can grab the basics with:
 ```bash
-sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-dev libedit-dev python3
+sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-dev libedit-dev python3 pkg-config
 ```
 
 ### Build in a hurry
@@ -38,6 +39,10 @@ sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-d
    ```bash
    ./build/sonshell --dir "$PWD/photos" --keepalive 3000
    ```
+
+### Headless builds
+
+If you are compiling on a machine without a GUI stack, pass `-DSONSHELL_HEADLESS=ON` to the CMake configure step. This skips the OpenCV/GTK dependencies and disables the live-view `monitor` command. The binary prints a reminder at startup and any `monitor` invocation warns that the build is headless.
 
 The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `build/`. Run the binary from inside `build/` (or keep the copied `.so` files alongside it) so live view keeps working.
 

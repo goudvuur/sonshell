@@ -46,8 +46,10 @@
 #include "CRSDK/CrImageDataBlock.h"
 #include "CRSDK/CrDefines.h"
 
+#ifndef SONSHELL_HEADLESS
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui/highgui_c.h>
+#endif
 
 #include "prop_names_generated.h"
 #include "error_names_generated.h"
@@ -1109,6 +1111,7 @@ static bool fetch_movie_recording_state(SDK::CrDeviceHandle handle,
   return ok;
 }
 
+#ifndef SONSHELL_HEADLESS
 static bool monitor_window_is_alive() {
   try {
     void* handle = cvGetWindowHandle(kMonitorWindowName);
@@ -1135,6 +1138,24 @@ static void monitor_join_stale_thread() {
     stale.join();
   }
 }
+#else
+static bool monitor_window_is_alive() {
+  return false;
+}
+
+static void monitor_join_stale_thread() {
+  std::thread stale;
+  {
+    std::lock_guard<std::mutex> lk(g_monitor_mtx);
+    if (g_monitor_running.load(std::memory_order_acquire)) return;
+    if (!g_monitor_thread.joinable()) return;
+    stale = std::move(g_monitor_thread);
+  }
+  if (stale.joinable()) {
+    stale.join();
+  }
+}
+#endif
 
 static unsigned char repl_trigger_shoot(EditLine* el, int) {
   el_push(el, "shoot\n");
@@ -1267,7 +1288,11 @@ static void log_command_overview() {
   LOGI("  shoot | trigger      Fire the shutter immediately (full press)");
   LOGI("  focus                Half-press + release to autofocus");
   LOGI("  sync [N|all|on|off]  Pull the latest files or mirror all contents; 'sync stop' aborts");
+#ifdef SONSHELL_HEADLESS
+  LOGI("  monitor start|stop   (disabled in headless builds)");
+#else
   LOGI("  monitor start|stop   Start/stop the live-view window (requires OpenCV deps)");
+#endif
   LOGI("  record start|stop    Toggle movie recording");
   LOGI("  power off            Ask the camera to power down (half-pressing the shutter will wake it up)");
   LOGI("  quit | exit          Leave SonShell");
@@ -1655,6 +1680,7 @@ static inline void wait_for_logs_or_timeout(int ms) {
   }
 }
 
+#ifndef SONSHELL_HEADLESS
 // ----------------------------
 // Live-view monitor helpers
 // ----------------------------
@@ -1895,6 +1921,21 @@ static void monitor_stop() {
   g_monitor_running.store(false, std::memory_order_release);
   g_monitor_stop_flag.store(false, std::memory_order_release);
 }
+#else
+// Headless build stubs -------------------------------------------------------
+static bool monitor_start(SDK::CrDeviceHandle handle, bool verbose) {
+  (void)handle;
+  (void)verbose;
+  LOGW("[monitor] Live view disabled in headless build (rebuild without -DSONSHELL_HEADLESS=ON)");
+  return false;
+}
+
+static void monitor_stop() {
+  monitor_join_stale_thread();
+  g_monitor_running.store(false, std::memory_order_release);
+  g_monitor_stop_flag.store(false, std::memory_order_release);
+}
+#endif
 
 // poll()-based getchar so logs can wake the REPL
 static int my_getc(EditLine* el, char* c) {
@@ -3217,6 +3258,10 @@ int main(int argc, char **argv) {
     else if (a == "--pass" && i + 1 < argc) auth_pass = argv[++i];
   }
 
+#ifdef SONSHELL_HEADLESS
+  LOGW("Live view disabled: SonShell built with -DSONSHELL_HEADLESS=ON (OpenCV omitted)");
+#endif
+
   if (!SDK::Init()) {
     LOGE( "Init failed" );
     return 1;
@@ -3664,6 +3709,11 @@ int main(int argc, char **argv) {
 	  return 0;
 	}},
 	{"monitor", [&](auto const& args)->int {
+	#ifdef SONSHELL_HEADLESS
+	  (void)args;
+	  LOGW("monitor command disabled in headless builds (rebuild without -DSONSHELL_HEADLESS=ON)");
+	  return 2;
+	#else
 	  if (args.size() < 2) {
 	    LOGE("usage: monitor start|stop");
 	    return 2;
@@ -3680,6 +3730,7 @@ int main(int argc, char **argv) {
 	  }
 	  LOGE("usage: monitor start|stop");
 	  return 2;
+	#endif
 	}},
 	{"power", [&](auto const& args)->int {
 	  if (args.size() < 2) {
