@@ -136,6 +136,11 @@ Automatic downloads queue in worker threads. Newly captured files are renamed to
 
 - Sony α6700 (body firmware v2.00)
 
+## Tested systems
+
+- Ubuntu 24.04.3 LTS x86_64
+- Ubuntu 24.04.3 LTS aarch64
+
 ---
 
 ## License
