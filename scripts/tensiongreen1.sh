@@ -8,6 +8,7 @@ cmdBase="$(basename $cmd)"
 cmdDir="$(dirname $cmd)"
 file="$1"
 fileExt="${file##*.}"
+fileExt="${fileExt,,}"   # convert extension to lowercase
 suffix="${cmdBase%.*}"
 showCmd="$cmdDir/show_single.sh"
 outfile="${file%.*}_${suffix}.$fileExt"
@@ -27,6 +28,24 @@ gmic ${file} \
      -fx_vignette ${vignette},70,95,0,0,0,255 \
      -o ${outfile} \
     &> /dev/null
+
+# post processing
+case "${fileExt,,}" in
+  jpg|jpeg)
+    # drop the compression to acceptable levels (422 subsampling and 92%)
+    # strip out exif data for security reasons
+    # optimize for web to load progressively
+    #mogrify -sampling-factor 4:2:2 -quality 92 -strip -interlace JPEG "${outfile}"
+    # mmmm, listmonk doesn't like subsampling, let's drop it
+    mogrify -quality 92 -strip -interlace JPEG "${outfile}"
+    ;;
+  png)
+    # NOOP
+    ;;
+  *)
+    # NOOP
+    ;;
+esac
 
 # now close the original and show the graded one instead
 eval "${showCmd} $outfile"

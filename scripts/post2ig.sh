@@ -71,6 +71,7 @@ FILES=("${ARGS[@]}")
 if [[ ${#FILES[@]} -eq 0 ]]; then usage; exit 2; fi
 
 # --- Basic checks ---
+# TODO ip="192.168.10.102"; for port in $(seq 37000 42000); do nc -z -w1 $ip $port 2>/dev/null && echo "Found open port: $port" && adb connect $ip:$port && break; done
 if ! adb get-state >/dev/null 2>&1; then
   echo "adb isn't connected. Run 'adb devices' and ensure your phone shows up." >&2
   exit 1
