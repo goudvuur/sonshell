@@ -1,6 +1,6 @@
 # SonShell - an effort to "ssh into my Sony camera"
 
-A Linux-only helper built on Sony’s official **Camera Remote SDK**. It connects to a Sony A6700 (and other supported bodies) over Wi-Fi or Ethernet, mirrors new captures straight to your workstation, and drops you into an interactive shell for remote control.
+A Linux-only helper built on Sony’s official **Camera Remote SDK**. It connects to supported Sony bodies (the full SDK model list is recognised) over Wi-Fi or Ethernet, mirrors new captures straight to your workstation, and drops you into an interactive shell for remote control.
 
 The shell can download files automatically, trigger the shutter, tweak exposure settings, start live view, run post-download hooks, and keep retrying if the camera drops offline. Everything runs from a single terminal window.
 
@@ -55,6 +55,7 @@ The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `
 | `--dir <path>` | Directory where downloads are stored. If omitted, files land in the working directory; providing an explicit folder is strongly recommended for sync features. |
 | `--ip <addr>` | Connect directly to a camera at the given IPv4 address (e.g. `192.168.1.1`). Skipped when enumerating automatically. |
 | `--mac <hex:mac>` | Optional MAC address for direct-IP connects (`aa:bb:cc:dd:ee:ff`). Used to seed the SDK’s Ethernet object. |
+| `--model <name>` | Optional camera model hint for direct-IP connects (e.g. `a7r5`, `fx3`, `zve1`). Enumeration ignores this flag and always picks the first discovered device. |
 | `--user <name>` | Username for cameras with Access Auth enabled. |
 | `--pass <password>` | Password for Access Auth. Combine with `--user`. |
 | `--cmd <path>` | Executable/script that SonShell calls for every file event (new downloads, syncs, rating changes, …). Arguments: `<path> <mode> <operation> [old] [new]`. Runs asynchronously; SonShell does not wait for completion. |
@@ -127,6 +128,41 @@ Automatic downloads queue in worker threads. Newly captured files are renamed to
 
 ---
 
+## Supported cameras
+
+SonShell recognises every entry in Sony’s `CrCameraDeviceModelList` (SDK v2.00.00). Common aliases like `a7r5`, `fx3`, `zve1`, and `a6000` resolve automatically when used with `--model` for direct-IP sessions. When no model is supplied SonShell simply connects to the first enumerated camera.
+
+- ILCE-7RM4 (`a7r4`, `a7rm4`)
+- ILCE-9M2 (`a9m2`, `a92`)
+- ILCE-7C (`a7c`)
+- ILCE-7SM3 (`a7s3`)
+- ILCE-1 (`a1`)
+- ILCE-7RM4A (`a7r4a`)
+- DSC-RX0M2 (`rx0m2`)
+- ILCE-7M4 (`a7m4`, `a74`)
+- ILME-FX3 (`fx3`)
+- ILME-FX30 (`fx30`)
+- ILME-FX6 (`fx6`)
+- ILCE-7RM5 (`a7r5`)
+- ZV-E1 (`zve1`)
+- ILCE-6700 (`a6700`)
+- ILCE-7CM2 (`a7c2`)
+- ILCE-7CR (`a7cr`)
+- ILX-LR1 (`lr1`)
+- MPC-2610 (`mpc2610`)
+- ILCE-9M3 (`a9m3`, `a93`)
+- ZV-E10M2 (`zve10m2`)
+- PXW-Z200 (`pxwz200`)
+- HXR-NX800 (`hxrnx800`)
+- ILCE-1M2 (`a1m2`, `a12`)
+- ILME-FX3A (`fx3a`)
+- BRC-AM7 (`brcam7`)
+- ILME-FR7 (`fr7`)
+- ILME-FX2 (`fx2`)
+- ILCE-6000 (`a6000` – legacy body without an explicit SDK enum)
+
+---
+
 ## How It’s Built
 - Single translation unit (`src/main.cpp`) stitches together the SDK callback interface, the REPL, and async transfer logic.
 - `QuietCallback` implements `SDK::IDeviceCallback`, dispatching transfers, aggregating progress, and feeding a log queue so the shell stays responsive.
@@ -139,7 +175,7 @@ Automatic downloads queue in worker threads. Newly captured files are renamed to
 
 ## Tested cameras
 
-- Sony α6700 (body firmware v2.00)
+- Sony α6700 (body firmware v2.00). Other models listed above share the same SDK support but have not been explicitly tested yet.
 
 ## Tested systems
 

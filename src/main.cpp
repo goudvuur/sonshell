@@ -37,6 +37,7 @@
 #include <initializer_list>
 #include <arpa/inet.h>
 #include <clocale>
+#include <optional>
 
 #include "CRSDK/CameraRemote_SDK.h"
 #include "CRSDK/ICrCameraObjectInfo.h"
@@ -2144,6 +2145,164 @@ static bool parse_mac(const std::string &mac_str, unsigned char mac[6]) {
 // Misc helpers
 // ----------------------------
 
+static std::string ascii_lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return s;
+}
+
+static std::string ascii_upper(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+    return static_cast<char>(std::toupper(c));
+  });
+  return s;
+}
+
+static std::string collapse_delims(std::string s) {
+  s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) {
+    return c == '-' || c == '_' || c == ' ';
+  }), s.end());
+  return s;
+}
+
+static std::string normalize_model_key(const std::string &value) {
+  return collapse_delims(ascii_lower(value));
+}
+
+struct CameraModelChoice {
+  std::string canonical;
+  std::optional<SDK::CrCameraDeviceModelList> direct_value;
+};
+
+struct CameraModelInfo {
+  const char *canonical;
+  std::optional<SDK::CrCameraDeviceModelList> direct_value;
+  std::initializer_list<const char *> extra_aliases;
+};
+
+static std::vector<std::string> heuristic_aliases(const std::string &canonical) {
+  std::vector<std::string> aliases;
+  std::string norm = normalize_model_key(canonical);
+  aliases.push_back(norm);
+
+  auto add_unique = [&](std::string alias) {
+    if (alias.empty()) return;
+    if (std::find(aliases.begin(), aliases.end(), alias) == aliases.end()) {
+      aliases.push_back(std::move(alias));
+    }
+  };
+
+  auto add_strip_prefix = [&](const std::string &prefix) {
+    if (norm.rfind(prefix, 0) == 0 && norm.size() > prefix.size()) {
+      add_unique(norm.substr(prefix.size()));
+    }
+  };
+
+  // ILCE-* bodies → add a/N variants (drops the "M" before numbers too).
+  if (norm.rfind("ilce", 0) == 0 && norm.size() > 4) {
+    std::string rest = norm.substr(4);
+    add_unique("a" + rest);
+
+    std::string trimmed = "a" + rest;
+    bool changed = false;
+    for (size_t i = 0; i + 1 < trimmed.size(); ++i) {
+      if (trimmed[i] == 'm' && std::isdigit(static_cast<unsigned char>(trimmed[i + 1]))) {
+        trimmed.erase(i, 1);
+        --i;
+        changed = true;
+      }
+    }
+    if (changed) add_unique(trimmed);
+  }
+
+  add_strip_prefix("ilme"); // cinema/FX bodies → allow "fx3" style
+  add_strip_prefix("dsc");  // compact bodies → allow "rx0m2"
+  add_strip_prefix("zv");   // vlog cameras → allow "e1", "e10m2"
+  add_strip_prefix("ilx");  // industrial bodies → allow "lr1"
+  add_strip_prefix("mpc");
+  add_strip_prefix("pxw");
+  add_strip_prefix("hxr");
+  add_strip_prefix("brc");
+
+  return aliases;
+}
+
+static const std::vector<CameraModelInfo> &camera_model_infos() {
+  static const std::vector<CameraModelInfo> infos = {
+    {"ILCE-7RM4", SDK::CrCameraDeviceModel_ILCE_7RM4, {}},
+    {"ILCE-9M2", SDK::CrCameraDeviceModel_ILCE_9M2, {}},
+    {"ILCE-7C", SDK::CrCameraDeviceModel_ILCE_7C, {}},
+    {"ILCE-7SM3", SDK::CrCameraDeviceModel_ILCE_7SM3, {}},
+    {"ILCE-1", SDK::CrCameraDeviceModel_ILCE_1, {}},
+    {"ILCE-7RM4A", SDK::CrCameraDeviceModel_ILCE_7RM4A, {}},
+    {"DSC-RX0M2", SDK::CrCameraDeviceModel_DSC_RX0M2, {}},
+    {"ILCE-7M4", SDK::CrCameraDeviceModel_ILCE_7M4, {}},
+    {"ILME-FX3", SDK::CrCameraDeviceModel_ILME_FX3, {}},
+    {"ILME-FX30", SDK::CrCameraDeviceModel_ILME_FX30, {}},
+    {"ILME-FX6", SDK::CrCameraDeviceModel_ILME_FX6, {}},
+    {"ILCE-7RM5", SDK::CrCameraDeviceModel_ILCE_7RM5, {}},
+    {"ZV-E1", SDK::CrCameraDeviceModel_ZV_E1, {}},
+    {"ILCE-6700", SDK::CrCameraDeviceModel_ILCE_6700, {}},
+    {"ILCE-7CM2", SDK::CrCameraDeviceModel_ILCE_7CM2, {}},
+    {"ILCE-7CR", SDK::CrCameraDeviceModel_ILCE_7CR, {}},
+    {"ILX-LR1", SDK::CrCameraDeviceModel_ILX_LR1, {}},
+    {"MPC-2610", SDK::CrCameraDeviceModel_MPC_2610, {}},
+    {"ILCE-9M3", SDK::CrCameraDeviceModel_ILCE_9M3, {}},
+    {"ZV-E10M2", SDK::CrCameraDeviceModel_ZV_E10M2, {}},
+    {"PXW-Z200", SDK::CrCameraDeviceModel_PXW_Z200, {}},
+    {"HXR-NX800", SDK::CrCameraDeviceModel_HXR_NX800, {}},
+    {"ILCE-1M2", SDK::CrCameraDeviceModel_ILCE_1M2, {}},
+    {"ILME-FX3A", SDK::CrCameraDeviceModel_ILME_FX3A, {}},
+    {"BRC-AM7", SDK::CrCameraDeviceModel_BRC_AM7, {}},
+    {"ILME-FR7", SDK::CrCameraDeviceModel_ILME_FR7, {}},
+    {"ILME-FX2", SDK::CrCameraDeviceModel_ILME_FX2, {}},
+    // Legacy/extra entries that lack enums in this SDK version
+    {"ILCE-6000", std::nullopt, {"a6000"}},
+  };
+  return infos;
+}
+
+static CameraModelChoice resolve_camera_model_choice(const std::string &keyword) {
+  if (keyword.empty()) {
+    return {std::string{}, std::nullopt};
+  }
+
+  static std::unordered_map<std::string, const CameraModelInfo*> lookup;
+  if (lookup.empty()) {
+    for (auto const &info : camera_model_infos()) {
+      auto aliases = heuristic_aliases(info.canonical);
+      for (auto const *extra : info.extra_aliases) {
+        aliases.push_back(normalize_model_key(extra));
+      }
+      for (auto &alias : aliases) {
+        if (alias.empty()) continue;
+        lookup.emplace(alias, &info);
+      }
+    }
+  }
+
+  std::string key = normalize_model_key(keyword);
+  auto it = lookup.find(key);
+  if (it != lookup.end()) {
+    const CameraModelInfo *info = it->second;
+    return {info->canonical, info->direct_value};
+  }
+
+  // Fall back to using the caller-provided string as canonical.
+  return {ascii_upper(keyword), std::nullopt};
+}
+
+static bool model_name_matches(const SDK::ICrCameraObjectInfo *info,
+                               const std::string &expected) {
+  if (!info) return false;
+  if (expected.empty()) return true;
+  const char *model_ptr = reinterpret_cast<const char*>(info->GetModel());
+  if (!model_ptr) return false;
+  std::string actual(model_ptr);
+  return ascii_upper(actual) == ascii_upper(expected);
+}
+
 static inline void interruptible_sleep(std::chrono::milliseconds total) {
   using namespace std::chrono;
   auto deadline = steady_clock::now() + total;
@@ -2971,6 +3130,7 @@ private:
 // Attempt a single connect (by direct IP or enumeration). Returns true on success.
 static bool try_connect_once(const std::string &explicit_ip,
                              const std::string &explicit_mac,
+                             const std::string &explicit_model,
                              const std::string &download_dir,
                              bool verbose,
                              const std::string &auth_user,
@@ -2984,10 +3144,14 @@ static bool try_connect_once(const std::string &explicit_ip,
   cb.verbose = verbose;
   SDK::CrError err = SDK::CrError_None;
   selected = nullptr; enum_list = nullptr; created = nullptr; handle = 0;
-  
+  auto model_choice = resolve_camera_model_choice(explicit_model);
+  bool have_canonical = !model_choice.canonical.empty();
+
+  SDK::CrCameraDeviceModelList direct_ip_model = model_choice.direct_value.value_or(SDK::CrCameraDeviceModel_ILCE_6700);
+  bool direct_model_is_guess = have_canonical && !model_choice.direct_value.has_value();
+
   // Used by the direct-IP path and (maybe) a retry:
   unsigned char direct_ip_mac[6] = {0,0,0,0,0,0};
-  SDK::CrCameraDeviceModelList direct_ip_model = SDK::CrCameraDeviceModel_ILCE_6700;
   
   // Parse explicit_ip ("x.y.z.w") into CrInt32u as required by the SDK
   CrInt32u direct_ip_addr_num = 0;
@@ -3012,24 +3176,85 @@ static bool try_connect_once(const std::string &explicit_ip,
       return false;
     }
     selected = enum_list->GetCameraObjectInfo(0);
-  } else {
-    // --- Direct IP path ---
-    if (!explicit_mac.empty() && !parse_mac(explicit_mac, direct_ip_mac)) {
-      LOGE("WARN bad MAC, ignoring: " << explicit_mac);
-    }
-    
-    // If the user provided credentials, default to SSH ON for first attempt.
-    CrInt32u sshSupportFlag = (!auth_user.empty() || !auth_pass.empty())
-      ? SDK::CrSSHsupport_ON
-      : SDK::CrSSHsupport_OFF;
-
-    // Initial direct-IP object
-    err = SDK::CreateCameraObjectInfoEthernetConnection(&created, direct_ip_model, direct_ip_addr_num, direct_ip_mac, sshSupportFlag);
-    if (err != SDK::CrError_None || !created) {
-      LOGE("CreateCameraObjectInfoEthernetConnection failed");
+    if (!selected) {
+      LOGE("Enumeration returned an empty camera list");
       return false;
     }
-    selected = created;
+    if (have_canonical && !model_name_matches(selected, model_choice.canonical)) {
+      const char *model_ptr = reinterpret_cast<const char*>(selected->GetModel());
+      LOGW("--model='" << model_choice.canonical
+           << "' ignored; proceeding with first enumerated camera"
+           << (model_ptr ? std::string(" ('") + model_ptr + "')" : std::string("")));
+    }
+  } else {
+    // --- Direct IP path ---
+    bool mac_filter_set = false;
+    if (!explicit_mac.empty()) {
+      if (!parse_mac(explicit_mac, direct_ip_mac)) {
+        LOGE("WARN bad MAC, ignoring: " << explicit_mac);
+      } else {
+        mac_filter_set = true;
+      }
+    }
+
+    // Attempt to reuse an enumerated object so we avoid guessing the model enum.
+    SDK::ICrEnumCameraObjectInfo *direct_enum = nullptr;
+    err = SDK::EnumCameraObjects(&direct_enum, 1);
+    if (err == SDK::CrError_None && direct_enum && direct_enum->GetCount() > 0) {
+      for (CrInt32u i = 0; i < direct_enum->GetCount(); ++i) {
+        auto info = direct_enum->GetCameraObjectInfo(i);
+        if (!info) continue;
+
+        bool ip_match = false;
+        const char *ip_char = reinterpret_cast<const char*>(info->GetIPAddressChar());
+        if (ip_char && *ip_char) {
+          ip_match = (explicit_ip == std::string(ip_char));
+        }
+        if (!ip_match && direct_ip_addr_num != 0) {
+          ip_match = (info->GetIPAddress() == direct_ip_addr_num);
+        }
+        if (!ip_match) continue;
+
+        bool mac_match = true;
+        if (mac_filter_set) {
+          auto cam_mac = info->GetMACAddress();
+          auto cam_mac_len = info->GetMACAddressSize();
+          mac_match = (cam_mac && cam_mac_len >= 6 && std::memcmp(cam_mac, direct_ip_mac, 6) == 0);
+        }
+        if (!mac_match) continue;
+
+        selected = info;
+        enum_list = direct_enum;
+        direct_enum = nullptr;
+        if (verbose) {
+          LOGI("Using enumerated camera object for IP " << explicit_ip);
+        }
+        break;
+      }
+    }
+    if (direct_enum) {
+      direct_enum->Release();
+      direct_enum = nullptr;
+    }
+
+    if (!selected) {
+      if (direct_model_is_guess) {
+        LOGI("Model enum for '" << model_choice.canonical << "' unavailable; attempting direct connect with default enum.");
+      }
+
+      // If the user provided credentials, default to SSH ON for first attempt.
+      CrInt32u sshSupportFlag = (!auth_user.empty() || !auth_pass.empty())
+        ? SDK::CrSSHsupport_ON
+        : SDK::CrSSHsupport_OFF;
+
+      // Initial direct-IP object
+      err = SDK::CreateCameraObjectInfoEthernetConnection(&created, direct_ip_model, direct_ip_addr_num, direct_ip_mac, sshSupportFlag);
+      if (err != SDK::CrError_None || !created) {
+        LOGE("CreateCameraObjectInfoEthernetConnection failed");
+        return false;
+      }
+      selected = created;
+    }
   }
 
   // -------- Credentials --------
@@ -3075,7 +3300,7 @@ static bool try_connect_once(const std::string &explicit_ip,
   if (verbose) LOGI(std::string("[AUTH] Authenticating (ssh support is ") + (ssh_on ? "on" : "off") + ")");
   if (user_ptr && verbose) LOGI("[AUTH] Using username to connect");
 
-  bool is_direct_ip = (created != nullptr);
+  bool is_direct_ip = using_direct_ip;
   
   auto reconnecting = SDK::CrReconnecting_ON;
   // First contact over direct IP should not be "reconnecting".
@@ -3238,7 +3463,7 @@ int main(int argc, char **argv) {
   install_signal_handlers();
   block_sigint_in_this_thread();
 
-  std::string explicit_ip, explicit_mac, download_dir;
+  std::string explicit_ip, explicit_mac, explicit_model, download_dir;
   bool verbose = false;
   std::string auth_user, auth_pass;
 
@@ -3249,6 +3474,7 @@ int main(int argc, char **argv) {
     else if (a == "--dir" && i + 1 < argc) download_dir = argv[++i];
     else if (a == "--verbose" || a == "-v") verbose = true;
     else if (a == "--cmd" && i + 1 < argc) g_post_cmd = argv[++i];
+    else if (a == "--model" && i + 1 < argc) explicit_model = argv[++i];
     else if (a == "--keepalive" && i + 1 < argc) {
       long long ms = std::atoll(argv[++i]);
       if (ms < 0) ms = 0;
@@ -3286,7 +3512,7 @@ int main(int argc, char **argv) {
     cb.last_error_code = 0;
     g_reconnect.store(false);
 
-    bool ok = try_connect_once(explicit_ip, explicit_mac, download_dir, verbose, auth_user, auth_pass, cb, handle, selected, enum_list, created);
+    bool ok = try_connect_once(explicit_ip, explicit_mac, explicit_model, download_dir, verbose, auth_user, auth_pass, cb, handle, selected, enum_list, created);
     
     if (!ok) {
       disconnect_and_release(handle, created, enum_list);
