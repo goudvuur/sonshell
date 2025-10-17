@@ -109,31 +109,6 @@ print_supported_backends() {
   printf '%s\n' "Supported backends: ${SUPPORTED_BACKENDS[*]}"
 }
 
-parse_kdeconnect_devices() {
-  local -n out_ids=$1
-  local -n out_names=$2
-  local line id name trimmed
-  while IFS= read -r line; do
-    line=${line%%$'\r'}
-    [[ -n $line ]] || continue
-    if [[ $line == *$'\t'* ]]; then
-      IFS=$'\t' read -r id name <<<"$line"
-    else
-      id=${line%%[[:space:]]*}
-      name=${line#"$id"}
-      name=${name# }
-    fi
-    [[ -n $id ]] || continue
-    if [[ ! $id =~ ^[0-9a-fA-F-]+$ ]]; then
-      continue
-    fi
-    trimmed=${name%% *\(}
-    trimmed=${trimmed%% }
-    out_ids+=("$id")
-    out_names+=("${trimmed:-$name}")
-  done
-}
-
 backend_kdeconnect_prepare() {
   local ip="$1"
   require_cmd kdeconnect-cli
@@ -156,7 +131,10 @@ backend_kdeconnect_prepare() {
     exit 3
   fi
 
-  local host_hint="${ip_hostname[$ip]:-}"
+  local host_hint=""
+  if [[ -n $ip ]]; then
+    host_hint=${ip_hostname[$ip]:-}
+  fi
   local host_norm=""
   if [[ -n $host_hint ]]; then
     host_norm=$(normalize_token "$host_hint")
@@ -453,7 +431,10 @@ backend_kdeconnect_prepare() {
     exit 3
   fi
 
-  local host_hint="${ip_hostname[$ip]:-}"
+  local host_hint=""
+  if [[ -n $ip ]]; then
+    host_hint="${ip_hostname[$ip]:-}"
+  fi
   local host_norm=""
   if [[ -n $host_hint ]]; then
     host_norm=$(normalize_token "$host_hint")
@@ -679,6 +660,13 @@ if (( verbose )); then
 fi
 
 if (( ${#ipv4_clients[@]} == 0 )); then
+  if [[ $backend == "kdeconnect" ]]; then
+    print_debug 'No neighbours found; falling back to KDE Connect device-only discovery'
+    backend_prepare "$backend" ""
+    backend_share "$backend" "${abs_files[@]}"
+    exit 0
+  fi
+
   print_error 'No active IPv4 neighbours passed the score filter.'
   exit 1
 fi
