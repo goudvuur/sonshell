@@ -88,6 +88,18 @@ When `--cmd` is provided SonShell calls the hook for every file-affecting event.
 
 The hook is executed asynchronously, so long-running work should be handled internally or by delegating to background jobs.
 
+## Scripts
+
+The `scripts/` directory contains helper utilities that SonShell can trigger through the `--cmd` hook or that you can run manually:
+
+- `scripts/broadcast.sh` – YAML-driven dispatcher that maps incoming hook arguments to one or more handler commands. Flags: `-v|--verbose` enables logging, `-c|--config PATH` points at an alternative YAML file, and `--help` prints usage. Pass `--` before the event payload (e.g. `broadcast.sh -v -- <path> playback rating 4 5`). Requires `python3` with `pyyaml` installed.
+- `scripts/debug.sh` – Diagnostic helper that shows the received arguments in a dialog (prefers `kdialog`, `zenity`, `dialog`, or `whiptail`, falling back to `echo`). Accepts any arguments; no flags.
+- `scripts/find_adb.sh` – Scans the network for Android devices listening for wireless ADB and optionally connects to the first match. Options: `-v` for verbose logs, `-s START:END` to set the port range, and `-m MIN_SCORE` to raise or lower the neighbour scoring threshold.
+- `scripts/share_android.sh` – Shares one or more image/video files to a paired Android device (default backend: KDE Connect). Options: `-v` verbose mode, `-m MIN_SCORE` for neighbour selection, `-b|--backend NAME` to choose an alternate sharing backend, and `-h|--help` for usage info. Expects file paths as positional arguments.
+- `scripts/show.sh` – Lightweight wrapper around `xdg-open` that simply opens the supplied file path (`show.sh <path>`).
+- `scripts/show_single.sh` – Opens an image in the desktop’s default viewer while ensuring only one viewer window launched by the script stays open. Usage: `show_single.sh <image-file>`.
+- `scripts/tensiongreen1.sh` – Applies a GMIC “tensiongreen1” grade to the provided photo, writes the processed copy next to the original, and displays it via `show_single.sh`. Usage: `tensiongreen1.sh <photo>` (requires GMIC/ImageMagick for the processing steps).
+
 ---
 
 ## Shell Command Reference

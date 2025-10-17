@@ -1,0 +1,31 @@
+#/************************************************************
+# * Broadcast Configuration                                 *
+# * ------------------------------------------------------- *
+# * Define handler mappings for SonShell camera events.     *
+# * Each indentation level aligns with the corresponding    *
+# * positional argument (arg1, arg2, ...). Keys support      *
+# * shell globs, and values can be single commands or lists *
+# * of commands. Use placeholders such as {1} to insert the  *
+# * nth argument into a command; commands without           *
+# * placeholders automatically receive the full argument    *
+# * list from the event.                                    *
+# *                                                         *
+# * Dependencies: python3, PyYAML (pip install --user        *
+# * pyyaml).                                                 *
+# ************************************************************/
+
+rules:
+  "*":
+    playback:
+      rating:
+        "*":
+          "3":
+            - handle_three_star.sh
+            - "share_android.sh {1}"
+          "1":
+            - debug.sh
+            - "share_android.sh {1}"
+    "record/still/auto":
+      new:
+        - handle_new_photo.sh
+        - "notify_desktop.sh {1}"
