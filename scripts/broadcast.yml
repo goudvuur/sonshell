@@ -20,12 +20,11 @@ rules:
       rating:
         "*":
           "3":
-            - handle_three_star.sh
-            - "share_android.sh {1}"
+#            - handle_three_star.sh
+#            - "debug.sh"
           "1":
-            - debug.sh
-            - "share_android.sh {1}"
+            - "bash -lc 'graded=$(gmic.sh --no-show {1}) && [ -n \"$graded\" ] && share_android.sh \"$graded\"'"
     "record/still/auto":
       new:
-        - handle_new_photo.sh
-        - "notify_desktop.sh {1}"
+#        - handle_new_photo.sh
+#        - "notify_desktop.sh {1}"

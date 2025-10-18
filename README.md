@@ -98,7 +98,7 @@ The `scripts/` directory contains helper utilities that SonShell can trigger thr
 - `scripts/share_android.sh` – Shares one or more image/video files to a paired Android device (default backend: KDE Connect). Options: `-v` verbose mode, `-m MIN_SCORE` for neighbour selection, `-b|--backend NAME` to choose an alternate sharing backend, and `-h|--help` for usage info. Expects file paths as positional arguments.
 - `scripts/show.sh` – Lightweight wrapper around `xdg-open` that simply opens the supplied file path (`show.sh <path>`).
 - `scripts/show_single.sh` – Opens an image in the desktop’s default viewer while ensuring only one viewer window launched by the script stays open. Usage: `show_single.sh <image-file>`.
-- `scripts/tensiongreen1.sh` – Applies a GMIC “tensiongreen1” grade to the provided photo, writes the processed copy next to the original, and displays it via `show_single.sh`. Usage: `tensiongreen1.sh <photo>` (requires GMIC/ImageMagick for the processing steps).
+- `scripts/gmic.sh` – Applies a configurable GMIC grade (default: `tensiongreen_1`) to the provided photo, writes the processed copy next to the original, and displays it via `show_single.sh`. Usage: `gmic.sh [-v] [--no-show] [--preset <name>] [--strength <0-1|0-100>] [--pre-resize <WxH>] [--post-quality <n|none>] [--post-strip <on|off>] [--post-interlace <mode|none>] [...] <photo>`; consult the script for all adjustment flags. `-v` enables colored debug logging; `--no-show` skips opening viewer windows and prints the graded file path so the script can be chained in automation. Requires GMIC/ImageMagick.
 
 ---
 
