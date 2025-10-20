@@ -58,7 +58,7 @@ The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `
 | `--model <name>` | Optional camera model hint for direct-IP connects (e.g. `a7r5`, `fx3`, `zve1`). Enumeration ignores this flag and always picks the first discovered device. |
 | `--user <name>` | Username for cameras with Access Auth enabled. |
 | `--pass <password>` | Password for Access Auth. Combine with `--user`. |
-| `--cmd <path>` | Executable/script that SonShell calls for every file event (new downloads, syncs, rating changes, …). Arguments: `<path> <mode> <operation> [old] [new]`. Runs asynchronously; SonShell does not wait for completion. |
+| `--cmd <path>` | Executable/script that SonShell calls for every file event (new downloads, syncs, rating changes, …). Arguments: `<path> <mode> <operation> [new] [old]`. Runs asynchronously; SonShell does not wait for completion. |
 | `--keepalive <ms>` | Reconnection delay after failure or disconnect. `0` disables retry (SonShell exits on error). |
 | `--verbose`, `-v` | Print detailed property-change logs and transfer progress from the SDK callbacks. |
 
@@ -71,7 +71,7 @@ If no `--ip` is provided SonShell enumerates available cameras and uses the firs
 When `--cmd` is provided SonShell calls the hook for every file-affecting event. The hook always receives:
 
 ```
-<path> <mode> <operation> [old] [new]
+<path> <mode> <operation> [new] [old]
 ```
 
 - `path` – absolute path to the newest local copy of the file.
@@ -84,7 +84,7 @@ When `--cmd` is provided SonShell calls the hook for every file-affecting event.
   - `new` – a freshly captured file copied to disk.
   - `sync` – a file mirrored during a manual/auto sync.
   - `rating` – the camera changed the star rating of a file (works wherever the SDK reports the update).
-- `old` / `new` – optional values tied to the operation (for `rating` they are the previous and current star counts, for `new`/`sync` only the `new` value is populated with the original camera path).
+- `new` / `old` – optional values tied to the operation. For `rating` hooks SonShell now sends the current star count first, followed by the previous value. For `new`/`sync` only the `new` value is populated with the original camera path.
 
 The hook is executed asynchronously, so long-running work should be handled internally or by delegating to background jobs.
 
@@ -92,10 +92,10 @@ The hook is executed asynchronously, so long-running work should be handled inte
 
 The `scripts/` directory contains helper utilities that SonShell can trigger through the `--cmd` hook or that you can run manually:
 
-- `scripts/broadcast.sh` – YAML-driven dispatcher that maps incoming hook arguments to one or more handler commands. Flags: `-v|--verbose` enables logging, `-c|--config PATH` points at an alternative YAML file, and `--help` prints usage. Pass `--` before the event payload (e.g. `broadcast.sh -v -- <path> playback rating 4 5`). Requires `python3` with `pyyaml` installed.
+- `scripts/broadcast.sh` – YAML-driven dispatcher that maps incoming hook arguments to one or more handler commands. Flags: `-v|--verbose` enables logging, `-c|--config PATH` points at an alternative YAML file, and `--help` prints usage. Pass `--` before the event payload (e.g. `broadcast.sh -v -- <path> playback rating 5 4`). Requires `python3` with `pyyaml` installed.
 - `scripts/debug.sh` – Diagnostic helper that shows the received arguments in a dialog (prefers `kdialog`, `zenity`, `dialog`, or `whiptail`, falling back to `echo`). Accepts any arguments; no flags.
 - `scripts/find_adb.sh` – Scans the network for Android devices listening for wireless ADB and optionally connects to the first match. Options: `-v` for verbose logs, `-s START:END` to set the port range, and `-m MIN_SCORE` to raise or lower the neighbour scoring threshold.
-- `scripts/share_android.sh` – Shares one or more image/video files to a paired Android device (default backend: KDE Connect). Options: `-v` verbose mode, `-m MIN_SCORE` for neighbour selection, `-b|--backend NAME` to choose an alternate sharing backend, and `-h|--help` for usage info. Expects file paths as positional arguments.
+- `scripts/to_android.sh` – Interacts with a paired Android device (default backend: KDE Connect). Actions: `send-file` (default) copies one or more image/video files, while `notify` pushes a notification to the handset. Options: `-v` verbose mode, `-m MIN_SCORE` for neighbour selection, `-b|--backend NAME` to choose an alternate transfer backend, `-a|--action ACTION` to pick `send-file`/`notify`, `--message TEXT` for the notification body (falls back to positional text), and `-h|--help` for usage info.
 - `scripts/show.sh` – Lightweight wrapper around `xdg-open` that simply opens the supplied file path (`show.sh <path>`).
 - `scripts/show_single.sh` – Opens an image in the desktop’s default viewer while ensuring only one viewer window launched by the script stays open. Usage: `show_single.sh <image-file>`.
 - `scripts/gmic.sh` – Applies a configurable GMIC grade (default: `tensiongreen_1`) to the provided photo, writes the processed copy next to the original, and displays it via `show_single.sh`. Usage: `gmic.sh [-v] [--no-show] [--preset <name>] [--strength <0-1|0-100>] [--pre-resize <WxH>] [--post-quality <n|none>] [--post-strip <on|off>] [--post-interlace <mode|none>] [...] <photo>`; consult the script for all adjustment flags. `-v` enables colored debug logging; `--no-show` skips opening viewer windows and prints the graded file path so the script can be chained in automation. Requires GMIC/ImageMagick.

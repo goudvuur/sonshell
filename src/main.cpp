@@ -2561,9 +2561,6 @@ public:
     if (!device_handle) return;
 
     auto playback_mode = fetch_property(device_handle, SDK::CrDeviceProperty_CameraOperatingMode);
-    auto playback_name = fetch_property(device_handle, SDK::CrDeviceProperty_PlaybackContentsName);
-    std::string playback_path = playback_name.text;
-
     auto playback_media = fetch_property(device_handle, SDK::CrDeviceProperty_PlaybackMedia);
     SDK::CrSlotNumber slot = SDK::CrSlotNumber_Slot1;
     if (playback_media.supported &&
@@ -2575,21 +2572,13 @@ public:
                                ? SDK::CrDeviceProperty_MediaSLOT2_ContentsInfoListUpdateTime
                                : SDK::CrDeviceProperty_MediaSLOT1_ContentsInfoListUpdateTime;
 
-    auto update_prop = fetch_property(device_handle, update_code);
-    if (!update_prop.supported || update_prop.value == 0) return;
-
-    std::uint64_t update_time = static_cast<std::uint64_t>(update_prop.value);
     auto &last_update = (slot == SDK::CrSlotNumber_Slot2) ? g_last_contents_update_slot2
                                                          : g_last_contents_update_slot1;
-
-    if (last_update.load(std::memory_order_relaxed) == update_time) return;
-
-    const int kMaxAttempts = 5;
+    const int kMaxAttempts = 8;
     const std::chrono::milliseconds kRetryDelay(200);
     bool have_initial = false;
     int initial_rating = 0;
     std::string local_path;
-    std::string remote_path = playback_path;
 
     SDK::CrContentsInfo *list = nullptr;
 
@@ -2610,13 +2599,14 @@ public:
       return true;
     };
 
-    auto match_file_by_path = [&](const SDK::CrContentsInfo *info) -> const SDK::CrContentsFile * {
+    auto match_file_by_path = [&](const SDK::CrContentsInfo *info,
+                                  const std::string &path) -> const SDK::CrContentsFile * {
       if (!info) return nullptr;
-      if (playback_path.empty()) return nullptr;
+      if (path.empty()) return nullptr;
       for (CrInt32u fi = 0; fi < info->filesNum; ++fi) {
         const char *fp = reinterpret_cast<const char *>(info->files[fi].filePath);
         if (!fp) continue;
-        if (playback_path == fp) {
+        if (path == fp) {
           return &info->files[fi];
         }
       }
@@ -2625,9 +2615,36 @@ public:
 
     bool handled = false;
     for (int attempt = 0; attempt < kMaxAttempts && !g_shutting_down.load(); ++attempt) {
+      auto playback_name = fetch_property(device_handle, SDK::CrDeviceProperty_PlaybackContentsName);
+      std::string playback_path = playback_name.text;
+
+      auto update_prop = fetch_property(device_handle, update_code);
+      if (!update_prop.supported || update_prop.value == 0) {
+        release_list(list);
+        if (attempt + 1 < kMaxAttempts) {
+          std::this_thread::sleep_for(kRetryDelay);
+          continue;
+        }
+        return;
+      }
+
+      std::uint64_t update_time = static_cast<std::uint64_t>(update_prop.value);
+      if (last_update.load(std::memory_order_relaxed) == update_time) {
+        release_list(list);
+        if (attempt + 1 < kMaxAttempts) {
+          std::this_thread::sleep_for(kRetryDelay);
+          continue;
+        }
+        return;
+      }
+
       CrInt32u count = 0;
       if (!fetch_list(list, count)) {
         release_list(list);
+        if (attempt + 1 < kMaxAttempts) {
+          std::this_thread::sleep_for(kRetryDelay);
+          continue;
+        }
         return;
       }
 
@@ -2645,7 +2662,7 @@ public:
           latest_info = &info;
         }
 
-        const SDK::CrContentsFile *matched = match_file_by_path(&info);
+        const SDK::CrContentsFile *matched = match_file_by_path(&info, playback_path);
         if (matched && !path_info) {
           path_info = &info;
           path_file = matched;
@@ -2697,8 +2714,19 @@ public:
         match_reason = "Falling back to most recently modified content.";
       }
 
+      std::string candidate_remote_path;
       if (target_file->filePath) {
-        remote_path = reinterpret_cast<const char *>(target_file->filePath);
+        candidate_remote_path = reinterpret_cast<const char *>(target_file->filePath);
+      }
+
+      if (!playback_path.empty() && !candidate_remote_path.empty() &&
+          candidate_remote_path != playback_path) {
+        release_list(list);
+        if (attempt + 1 < kMaxAttempts) {
+          std::this_thread::sleep_for(kRetryDelay);
+          continue;
+        }
+        return;
       }
 
       int rating_value = contents_rating_to_int(target_info->rating);
@@ -2728,6 +2756,7 @@ public:
       }
 
       if (!rating_changed) {
+        release_list(list);
         if (attempt + 1 < kMaxAttempts) {
           std::this_thread::sleep_for(kRetryDelay);
           continue;
@@ -2736,7 +2765,7 @@ public:
           std::lock_guard<std::mutex> lk(g_rating_mtx);
           g_last_known_ratings[rating_key] = rating_value;
         }
-        release_list(list);
+        last_update.store(update_time, std::memory_order_relaxed);
         return;
       }
 
@@ -2768,7 +2797,7 @@ public:
 
       if (!g_post_cmd.empty() && !local_path.empty()) {
         std::vector<std::string> args{local_path, mode_text, "rating",
-                                      std::to_string(prev_rating), std::to_string(rating_value)};
+                                      std::to_string(rating_value), std::to_string(prev_rating)};
         run_post_cmd_args(g_post_cmd, args);
       }
 
