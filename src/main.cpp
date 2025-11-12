@@ -38,6 +38,8 @@
 #include <arpa/inet.h>
 #include <clocale>
 #include <optional>
+#include <cerrno>
+#include <linux/input.h>
 
 #include "CRSDK/CameraRemote_SDK.h"
 #include "CRSDK/ICrCameraObjectInfo.h"
@@ -76,8 +78,12 @@ static std::atomic<int>  g_sync_active{0};   // how many boot-spawned workers ar
 static std::atomic<bool> g_sync_all{false};
 static std::atomic<bool> g_sync_abort{false};
 static std::atomic<bool> g_sync_running{false};
-static std::atomic<bool> g_auto_sync_enabled{true};
+static std::atomic<bool> g_auto_sync_enabled{false};
 static std::atomic<bool> g_sigint_requested{false};
+static std::atomic<bool> g_shutdown_requested{false};
+static std::atomic<bool> g_force_close_requested{false};
+static std::atomic<bool> g_force_close_logged{false};
+static std::atomic<int>  g_sigint_count{0};
 
 static std::mutex        g_monitor_mtx;
 static std::thread       g_monitor_thread;
@@ -88,6 +94,16 @@ static std::atomic<std::uint64_t> g_last_contents_update_slot1{0};
 static std::atomic<std::uint64_t> g_last_contents_update_slot2{0};
 static std::mutex g_rating_mtx;
 static std::unordered_map<std::uint64_t, int> g_last_known_ratings;
+
+struct InputMapDevice {
+  std::string path;
+  std::unordered_map<int, std::vector<std::string>> key_to_command;
+};
+static std::vector<std::thread> g_input_device_threads;
+static std::mutex g_command_runner_mutex;
+static std::condition_variable g_command_runner_cv;
+static std::function<int(const std::vector<std::string>&)> g_command_runner;
+static std::mutex g_command_exec_mutex;
 
 static const char* camera_power_status_to_string(SDK::CrCameraPowerStatus status) {
   switch (status) {
@@ -1250,6 +1266,27 @@ static inline void log_enqueue(LogLevel lvl, std::string msg) {
 #define LOGE(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Error, _oss.str()); } while(0)
 #define LOGD(expr) do { std::ostringstream _oss; _oss << expr; log_enqueue(LogLevel::Debug, _oss.str()); } while(0)
 
+static inline void wake_repl_loop() {
+  if (g_wake_pipe[1] != -1) {
+    char x = 0;
+    (void)!write(g_wake_pipe[1], &x, 1);
+  }
+}
+
+static inline void request_shutdown(bool force) {
+  g_stop.store(true, std::memory_order_release);
+  g_shutting_down.store(true, std::memory_order_release);
+  if (force) g_force_close_requested.store(true, std::memory_order_release);
+  wake_repl_loop();
+}
+
+static inline void maybe_log_force_close() {
+  if (g_force_close_requested.load(std::memory_order_acquire) &&
+      !g_force_close_logged.exchange(true, std::memory_order_acq_rel)) {
+    LOGW("Force-close requested; skipping remaining waits.");
+  }
+}
+
 static void log_exposure_mode_hint(SDK::CrDeviceHandle handle,
                                    const char* subcommand,
                                    std::initializer_list<SDK::CrExposureProgram> required_modes) {
@@ -1281,6 +1318,42 @@ static bool exposure_error_suggests_mode_change(SDK::CrError err) {
   return false;
 }
 
+static bool tap_camera_button(SDK::CrDeviceHandle handle,
+                              SDK::CrCameraButtonFunction button,
+                              const char* label) {
+  if (!handle) {
+    LOGE("button: camera handle unavailable");
+    return false;
+  }
+  auto send_edge = [&](SDK::CrCameraButtonFunctionValue edge,
+                       const char* edge_name) -> bool {
+    SDK::CrDeviceProperty prop;
+    prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_CameraButtonFunction);
+    prop.SetValueType(SDK::CrDataType::CrDataType_UInt32Range);
+    CrInt32u payload = static_cast<CrInt32u>(button) +
+                       static_cast<CrInt32u>(edge);
+    prop.SetCurrentValue(payload);
+    auto err = SDK::SetDeviceProperty(handle, &prop);
+    if (err != SDK::CrError_None) {
+      unsigned code = static_cast<unsigned>(err);
+      LOGE("button: failed to send " << label << ' ' << edge_name
+           << " event: " << crsdk_err::error_to_name(err)
+           << " (0x" << std::hex << code << std::dec << ")");
+      return false;
+    }
+    return true;
+  };
+
+  if (!send_edge(SDK::CrCameraButtonFunctionValue_Down, "down")) {
+    return false;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  if (!send_edge(SDK::CrCameraButtonFunctionValue_Up, "up")) {
+    return false;
+  }
+  return true;
+}
+
 static void log_command_overview() {
   LOGI("SonShell commands:");
   LOGI("  help                 Show this command overview");
@@ -1295,6 +1368,9 @@ static void log_command_overview() {
   LOGI("  monitor start|stop   Start/stop the live-view window (requires OpenCV deps)");
 #endif
   LOGI("  record start|stop    Toggle movie recording");
+  LOGI("  button dpad ...      Tap the rear d-pad (left/right/up/down/center) buttons");
+  LOGI("  button playback      Toggle the camera playback button");
+  LOGI("  button shutter|movie Tap the top shutter or movie buttons");
   LOGI("  power off            Ask the camera to power down (half-pressing the shutter will wake it up)");
   LOGI("  quit | exit          Leave SonShell");
   LOGI("Shortcuts:");
@@ -1302,7 +1378,7 @@ static void log_command_overview() {
   LOGI("  Ctrl+D               Quit the shell (same as 'exit')");
   LOGI("  F1 / 'trigger'       Fire shutter (mapped by the REPL)");
   LOGI("Notes:");
-  LOGI("  Use '--dir' at launch to pick a download folder; '--cmd' runs a hook per file");
+  LOGI("  Use '--sync-dir' at launch to pick a download folder; '--cmd' runs a hook per file");
   LOGI("  Auto-download can be toggled at runtime with 'sync on' / 'sync off'");
   LOGI("  Some exposure controls require the camera's physical mode dial to match");
 }
@@ -1636,6 +1712,60 @@ static bool send_movie_record_button_press(SDK::CrDeviceHandle handle,
     LOGE("Record: button up failed: " << crsdk_err::error_to_name(up_err)
          << " (0x" << std::hex << code << std::dec << ")");
     return false;
+  }
+
+  return true;
+}
+
+static bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
+                                       bool verbose_logs,
+                                       const char* label) {
+  const char* tag = (label && *label) ? label : "shutter";
+  if (!handle) {
+    LOGE(tag << ": camera handle unavailable");
+    return false;
+  }
+
+  if (verbose_logs) LOGI(tag << ": capture image...");
+
+  SDK::CrDeviceProperty s1;
+  s1.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
+  s1.SetValueType(SDK::CrDataType::CrDataType_UInt16);
+  s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
+  auto s1_lock_err = SDK::SetDeviceProperty(handle, &s1);
+  if (s1_lock_err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(s1_lock_err);
+    LOGE(tag << ": failed to half-press shutter: " << crsdk_err::error_to_name(s1_lock_err)
+         << " (0x" << std::hex << code << std::dec << ")");
+    return false;
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  if (verbose_logs) LOGI(tag << ": shutter down");
+  auto down_err = SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Down);
+  if (down_err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(down_err);
+    LOGE(tag << ": shutter down failed: " << crsdk_err::error_to_name(down_err)
+         << " (0x" << std::hex << code << std::dec << ")");
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(35));
+
+  if (verbose_logs) LOGI(tag << ": shutter up");
+  auto up_err = SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Up);
+  if (up_err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(up_err);
+    LOGE(tag << ": shutter up failed: " << crsdk_err::error_to_name(up_err)
+         << " (0x" << std::hex << code << std::dec << ")");
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+  auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
+  if (s1_unlock_err != SDK::CrError_None) {
+    unsigned code = static_cast<unsigned>(s1_unlock_err);
+    LOGE(tag << ": failed to release half-press: " << crsdk_err::error_to_name(s1_unlock_err)
+         << " (0x" << std::hex << code << std::dec << ")");
   }
 
   return true;
@@ -2012,13 +2142,23 @@ static int my_getc(EditLine* el, char* c) {
 // Signals
 // ----------------------------
 static void signal_handler(int sig) {
-  if (sig == SIGINT && g_repl_active.load(std::memory_order_relaxed)) {
-    g_sigint_requested.store(true, std::memory_order_relaxed);
-  } else {
-    g_stop.store(true, std::memory_order_relaxed);
+  if (sig == SIGINT) {
+    if (g_repl_active.load(std::memory_order_relaxed) &&
+        !g_shutdown_requested.load(std::memory_order_relaxed)) {
+      g_sigint_requested.store(true, std::memory_order_relaxed);
+      return;
+    }
+    int count = g_sigint_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    bool force = (count >= 2);
+    g_shutdown_requested.store(true, std::memory_order_release);
+    request_shutdown(force);
+    if (force && count >= 3) {
+      _exit(130);
+    }
+    return;
   }
-  // Nudge the REPL/input loop so my_getc() notices the change promptly
-  if (g_wake_pipe[1] != -1) { char x = 0; (void)!write(g_wake_pipe[1], &x, 1); }
+  g_shutdown_requested.store(true, std::memory_order_release);
+  request_shutdown(true);
 }
 
 static void install_signal_handlers() {
@@ -2090,6 +2230,31 @@ static std::string get_cache_dir() {
   const char *h = std::getenv("HOME");
   if (h) return std::string(h) + "/.cache/sonshell";
   return ".";
+}
+
+static std::string expand_user_path(const std::string& path) {
+  if (path.empty() || path[0] != '~') return path;
+  const char* home = std::getenv("HOME");
+  if (!home || !*home) return path;
+  if (path.size() == 1) return std::string(home);
+  if (path[1] == '/' || path[1] == '\\') {
+    return std::string(home) + path.substr(1);
+  }
+  // We don't support ~otheruser; return original string.
+  return path;
+}
+
+static std::string default_input_map_path() {
+  const char* home = std::getenv("HOME");
+  if (!home || !*home) return {};
+  return std::string(home) + "/.config/sonshell/input-map.yaml";
+}
+
+static bool ensure_sync_directory_configured(const char* context) {
+  if (!g_download_dir.empty()) return true;
+  const char* tag = (context && *context) ? context : "sync";
+  LOGE(tag << ": no sync directory configured; restart with '--sync-dir <path>' to enable transfers.");
+  return false;
 }
 
 static bool load_fingerprint(const std::string &path, std::vector<char> &buf) {
@@ -3157,7 +3322,7 @@ private:
 };
 
 // Attempt a single connect (by direct IP or enumeration). Returns true on success.
-static bool try_connect_once(const std::string &explicit_ip,
+static bool try_connect_once(const std::string &explicit_host,
                              const std::string &explicit_mac,
                              const std::string &explicit_model,
                              const std::string &download_dir,
@@ -3182,21 +3347,21 @@ static bool try_connect_once(const std::string &explicit_ip,
   // Used by the direct-IP path and (maybe) a retry:
   unsigned char direct_ip_mac[6] = {0,0,0,0,0,0};
   
-  // Parse explicit_ip ("x.y.z.w") into CrInt32u as required by the SDK
+  // Parse explicit_host ("x.y.z.w") into CrInt32u as required by the SDK
   CrInt32u direct_ip_addr_num = 0;
-  if (!explicit_ip.empty()) {
+  if (!explicit_host.empty()) {
     struct in_addr ina{};
-    if (inet_pton(AF_INET, explicit_ip.c_str(), &ina) == 1) {
+    if (inet_pton(AF_INET, explicit_host.c_str(), &ina) == 1) {
       // Keep network byte order (big-endian) as CrInt32u
       direct_ip_addr_num = static_cast<CrInt32u>(ina.s_addr);
     } else {
-      LOGE("Invalid IPv4 address: " << explicit_ip);
+      LOGE("Invalid IPv4 address: " << explicit_host);
       return false;
     }
   }
   
   // -------- Discover or create camera object --------
-  const bool using_direct_ip = !explicit_ip.empty();
+  const bool using_direct_ip = !explicit_host.empty();
   if (!using_direct_ip) {
     if (verbose) LOGI("Searching for cameras...");
     err = SDK::EnumCameraObjects(&enum_list, 1);
@@ -3237,7 +3402,7 @@ static bool try_connect_once(const std::string &explicit_ip,
         bool ip_match = false;
         const char *ip_char = reinterpret_cast<const char*>(info->GetIPAddressChar());
         if (ip_char && *ip_char) {
-          ip_match = (explicit_ip == std::string(ip_char));
+          ip_match = (explicit_host == std::string(ip_char));
         }
         if (!ip_match && direct_ip_addr_num != 0) {
           ip_match = (info->GetIPAddress() == direct_ip_addr_num);
@@ -3256,7 +3421,7 @@ static bool try_connect_once(const std::string &explicit_ip,
         enum_list = direct_enum;
         direct_enum = nullptr;
         if (verbose) {
-          LOGI("Using enumerated camera object for IP " << explicit_ip);
+          LOGI("Using enumerated camera object for IP " << explicit_host);
         }
         break;
       }
@@ -3342,7 +3507,7 @@ static bool try_connect_once(const std::string &explicit_ip,
   }
   
  // -------- Connect --------
-  std::string target_desc = explicit_ip.empty() ? "camera" : ("camera at " + explicit_ip);
+  std::string target_desc = explicit_host.empty() ? "camera" : ("camera at " + explicit_host);
   LOGI("Connecting to " << target_desc << "...");
   err = SDK::Connect(const_cast<SDK::ICrCameraObjectInfo *>(selected), &cb, &handle,
                      SDK::CrSdkControlMode_RemoteTransfer, reconnecting,
@@ -3393,9 +3558,13 @@ static bool try_connect_once(const std::string &explicit_ip,
 
   // -------- Wait for handshake completion --------
   {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
     std::unique_lock<std::mutex> lk(cb.mtx);
-    cb.conn_cv.wait_for(lk, std::chrono::seconds(12),
-                        [&] { return cb.connected || cb.conn_finished || g_stop.load(); });
+    while (!cb.connected && !cb.conn_finished && !g_stop.load(std::memory_order_relaxed)) {
+      if (cb.conn_cv.wait_for(lk, std::chrono::milliseconds(100)) == std::cv_status::timeout) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+      }
+    }
   }
   if (!cb.connected) {
     std::ostringstream _m;
@@ -3407,9 +3576,9 @@ static bool try_connect_once(const std::string &explicit_ip,
 
   cb.device_handle = handle;
     if (verbose) {
-      LOGI("Connected. Ctrl+C to stop.");
+      LOGI("Connected. Ctrl+D to stop.");
     } else {
-      LOGI("Connected. Ctrl+C to stop.");
+      LOGI("Connected. Ctrl+D to stop.");
     }
 
   // -------- Persist (updated) fingerprint for next run --------
@@ -3443,7 +3612,7 @@ static void disconnect_and_release(SDK::CrDeviceHandle &handle,
 
 // simple word list
 static const std::vector<std::string> commands = {
-  "shoot", "trigger", "focus", "sync", "monitor", "record", "status", "exposure", "power", "quit", "exit"
+  "shoot", "trigger", "focus", "sync", "monitor", "record", "button", "status", "exposure", "power", "quit", "exit"
 };
 
 char* prompt(EditLine*) {
@@ -3481,6 +3650,308 @@ static std::vector<std::string> tokenize(std::string const& s) {
   return out;
 }
 
+static std::string join_tokens(const std::vector<std::string>& tokens) {
+  if (tokens.empty()) return {};
+  return join_args(tokens, 0);
+}
+
+static bool split_key_value_line(const std::string& line,
+                                 std::string& key,
+                                 std::string& value) {
+  auto pos = line.find(':');
+  if (pos == std::string::npos) return false;
+  key = trim_copy(line.substr(0, pos));
+  value = trim_copy(line.substr(pos + 1));
+  if (!value.empty() && value.front() == '"' && value.back() == '"' && value.size() >= 2) {
+    value = value.substr(1, value.size() - 2);
+  }
+  return !key.empty();
+}
+
+static bool parse_key_code_token(const std::string& raw, int& code_out) {
+  if (raw.empty()) return false;
+  bool numeric = std::isdigit(static_cast<unsigned char>(raw.front()));
+  if (!numeric && raw.size() > 1 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
+    numeric = true;
+  }
+  if (numeric) {
+    try {
+      code_out = std::stoi(raw, nullptr, 0);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  std::string key = raw;
+  std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+    return static_cast<char>(std::toupper(c));
+  });
+
+#define KEY_ENTRY(name) {#name, name}
+  static const std::unordered_map<std::string, int> kKeyCodeMap = {
+    KEY_ENTRY(KEY_LEFT), KEY_ENTRY(KEY_RIGHT), KEY_ENTRY(KEY_UP), KEY_ENTRY(KEY_DOWN),
+    KEY_ENTRY(KEY_ENTER), KEY_ENTRY(KEY_OK), KEY_ENTRY(KEY_ESC), KEY_ENTRY(KEY_BACKSPACE),
+    KEY_ENTRY(KEY_SPACE), KEY_ENTRY(KEY_TAB), KEY_ENTRY(KEY_HOME), KEY_ENTRY(KEY_END),
+    KEY_ENTRY(KEY_PAGEUP), KEY_ENTRY(KEY_PAGEDOWN), KEY_ENTRY(KEY_MENU), KEY_ENTRY(KEY_INFO),
+    KEY_ENTRY(KEY_CAMERA), KEY_ENTRY(KEY_RECORD), KEY_ENTRY(KEY_PLAYPAUSE),
+    KEY_ENTRY(KEY_STOP), KEY_ENTRY(KEY_VOLUMEUP), KEY_ENTRY(KEY_VOLUMEDOWN),
+    KEY_ENTRY(KEY_MUTE), KEY_ENTRY(KEY_MEDIA), KEY_ENTRY(KEY_F1), KEY_ENTRY(KEY_F2),
+    KEY_ENTRY(KEY_F3), KEY_ENTRY(KEY_F4), KEY_ENTRY(KEY_F5), KEY_ENTRY(KEY_F6),
+    KEY_ENTRY(KEY_F7), KEY_ENTRY(KEY_F8), KEY_ENTRY(KEY_F9), KEY_ENTRY(KEY_F10),
+    KEY_ENTRY(KEY_F11), KEY_ENTRY(KEY_F12), KEY_ENTRY(KEY_1), KEY_ENTRY(KEY_2),
+    KEY_ENTRY(KEY_3), KEY_ENTRY(KEY_4), KEY_ENTRY(KEY_5), KEY_ENTRY(KEY_6),
+    KEY_ENTRY(KEY_7), KEY_ENTRY(KEY_8), KEY_ENTRY(KEY_9), KEY_ENTRY(KEY_0),
+    KEY_ENTRY(KEY_A), KEY_ENTRY(KEY_B), KEY_ENTRY(KEY_C), KEY_ENTRY(KEY_D),
+    KEY_ENTRY(KEY_E), KEY_ENTRY(KEY_F), KEY_ENTRY(KEY_G), KEY_ENTRY(KEY_H),
+    KEY_ENTRY(KEY_I), KEY_ENTRY(KEY_J), KEY_ENTRY(KEY_K), KEY_ENTRY(KEY_L),
+    KEY_ENTRY(KEY_M), KEY_ENTRY(KEY_N), KEY_ENTRY(KEY_O), KEY_ENTRY(KEY_P),
+    KEY_ENTRY(KEY_Q), KEY_ENTRY(KEY_R), KEY_ENTRY(KEY_S), KEY_ENTRY(KEY_T),
+    KEY_ENTRY(KEY_U), KEY_ENTRY(KEY_V), KEY_ENTRY(KEY_W), KEY_ENTRY(KEY_X),
+    KEY_ENTRY(KEY_Y), KEY_ENTRY(KEY_Z),
+    KEY_ENTRY(BTN_LEFT), KEY_ENTRY(BTN_RIGHT), KEY_ENTRY(BTN_MIDDLE),
+    KEY_ENTRY(BTN_SOUTH), KEY_ENTRY(BTN_EAST), KEY_ENTRY(BTN_NORTH),
+    KEY_ENTRY(BTN_WEST)
+  };
+#undef KEY_ENTRY
+
+  auto it = kKeyCodeMap.find(key);
+  if (it == kKeyCodeMap.end()) return false;
+  code_out = it->second;
+  return true;
+}
+
+static bool parse_input_map_config(const std::string& path,
+                                   std::vector<InputMapDevice>& out,
+                                   std::string& error) {
+  std::ifstream in(path);
+  if (!in) {
+    error = "input-map: unable to open " + path;
+    return false;
+  }
+
+  InputMapDevice current;
+  bool device_active = false;
+  bool in_bindings = false;
+  int line_no = 0;
+
+  auto finalize_device = [&]() -> bool {
+    if (!device_active) return true;
+    if (current.path.empty()) {
+      error = "input-map: device missing 'path:' entry";
+      return false;
+    }
+    out.push_back(current);
+    current = InputMapDevice{};
+    device_active = false;
+    in_bindings = false;
+    return true;
+  };
+
+  while (in.good()) {
+    std::string raw_line;
+    std::getline(in, raw_line);
+    if (!in && raw_line.empty()) break;
+    ++line_no;
+    std::string line = raw_line;
+    auto comment = line.find('#');
+    if (comment != std::string::npos) line.erase(comment);
+
+    int indent = 0;
+    while (indent < static_cast<int>(line.size()) && line[indent] == ' ') ++indent;
+
+    bool list_item = false;
+    int content_start = indent;
+    if (content_start < static_cast<int>(line.size()) && line[content_start] == '-') {
+      list_item = true;
+      ++content_start;
+      if (content_start < static_cast<int>(line.size()) && line[content_start] == ' ') ++content_start;
+    }
+
+    std::string content = trim_copy(line.substr(content_start));
+    if (content.empty()) continue;
+
+    if (indent == 0 && content == "input:") {
+      continue;
+    }
+    if (indent == 2 && content == "devices:") {
+      continue;
+    }
+    if (indent == 4 && list_item) {
+      if (!finalize_device()) return false;
+      device_active = true;
+      in_bindings = false;
+      if (!content.empty()) {
+        std::string key, value;
+        if (!split_key_value_line(content, key, value)) {
+          error = "input-map: expected 'path: ...' after '-' on line " + std::to_string(line_no);
+          return false;
+        }
+        if (key != "path") {
+          error = "input-map: only 'path' may follow '-' directly (line " + std::to_string(line_no) + ")";
+          return false;
+        }
+        current.path = expand_user_path(value);
+      }
+      continue;
+    }
+    if (!device_active) {
+      error = "input-map: device attributes appeared before '- path:' (line " + std::to_string(line_no) + ")";
+      return false;
+    }
+
+    if (indent >= 6 && indent < 8) {
+      std::string key, value;
+      if (!split_key_value_line(content, key, value)) {
+        error = "input-map: expected 'key: value' on line " + std::to_string(line_no);
+        return false;
+      }
+      if (key == "path") {
+        current.path = expand_user_path(value);
+      } else if (key == "bindings") {
+        if (!value.empty()) {
+          error = "input-map: 'bindings' must not have an inline value (line " + std::to_string(line_no) + ")";
+          return false;
+        }
+        in_bindings = true;
+      } else {
+        error = "input-map: unknown device key '" + key + "' (line " + std::to_string(line_no) + ")";
+        return false;
+      }
+      continue;
+    }
+
+    if (indent >= 8 && in_bindings) {
+      std::string key, value;
+      if (!split_key_value_line(content, key, value)) {
+        error = "input-map: expected 'KEY_NAME: command' (line " + std::to_string(line_no) + ")";
+        return false;
+      }
+      if (value.empty()) {
+        error = "input-map: command for '" + key + "' is empty (line " + std::to_string(line_no) + ")";
+        return false;
+      }
+      int key_code = 0;
+      if (!parse_key_code_token(key, key_code)) {
+        error = "input-map: unknown key '" + key + "' (line " + std::to_string(line_no) + ")";
+        return false;
+      }
+      auto tokens = tokenize(value);
+      if (tokens.empty()) {
+        error = "input-map: command for '" + key + "' parses to zero tokens (line " + std::to_string(line_no) + ")";
+        return false;
+      }
+      current.key_to_command[key_code] = tokens;
+      continue;
+    }
+
+    error = "input-map: unsupported indentation on line " + std::to_string(line_no);
+    return false;
+  }
+
+  if (!finalize_device()) return false;
+  if (out.empty()) {
+    error = "input-map: no devices defined in " + path;
+    return false;
+  }
+  return true;
+}
+
+static std::function<int(const std::vector<std::string>&)> wait_for_command_runner() {
+  std::unique_lock<std::mutex> lk(g_command_runner_mutex);
+  g_command_runner_cv.wait(lk, [] {
+    return g_command_runner || g_stop.load(std::memory_order_relaxed);
+  });
+  if (!g_command_runner) return {};
+  return g_command_runner;
+}
+
+static int run_input_mapped_command(const std::vector<std::string>& tokens) {
+  if (tokens.empty()) return 0;
+  auto runner = wait_for_command_runner();
+  if (!runner) return 1;
+  return runner(tokens);
+}
+
+static void input_device_thread_main(InputMapDevice device) {
+  const std::string label = device.path.empty() ? "<unknown>" : device.path;
+  constexpr std::chrono::milliseconds kRetryDelay{1000};
+
+  while (!g_stop.load(std::memory_order_relaxed)) {
+    int fd = open(device.path.c_str(), O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+      int err = errno;
+      LOGE("input-map: failed to open " << label << ": " << std::strerror(err));
+      std::this_thread::sleep_for(kRetryDelay);
+      continue;
+    }
+    LOGI("input-map: listening on " << label << " (" << device.key_to_command.size() << " bindings)");
+
+    while (!g_stop.load(std::memory_order_relaxed)) {
+      struct pollfd pfd { fd, POLLIN, 0 };
+      int pr = poll(&pfd, 1, 250);
+      if (pr < 0) {
+        if (errno == EINTR) continue;
+        LOGE("input-map: poll failed on " << label << ": " << std::strerror(errno));
+        break;
+      }
+      if (pr == 0) continue;
+      if (!(pfd.revents & POLLIN)) continue;
+
+      struct input_event ev {};
+      ssize_t n = read(fd, &ev, sizeof(ev));
+      if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN) continue;
+        LOGE("input-map: read failed on " << label << ": " << std::strerror(errno));
+        break;
+      }
+      if (n != sizeof(ev)) continue;
+      if (ev.type != EV_KEY) continue;
+      if (ev.value != 1) continue;
+
+      auto it = device.key_to_command.find(ev.code);
+      if (it == device.key_to_command.end()) continue;
+
+      int rc = run_input_mapped_command(it->second);
+      if (rc != 0) {
+        LOGW("input-map: command '" << join_tokens(it->second) << "' returned " << rc);
+      }
+    }
+
+    close(fd);
+    if (g_stop.load(std::memory_order_relaxed)) break;
+    LOGW("input-map: device " << label << " disconnected; retrying in " << kRetryDelay.count() << " ms");
+    std::this_thread::sleep_for(kRetryDelay);
+  }
+}
+
+static void start_input_map_threads(const std::vector<InputMapDevice>& devices,
+                                    const std::string& source_path) {
+  if (devices.empty()) return;
+  if (!source_path.empty()) {
+    LOGI("input-map: loaded " << devices.size() << " device(s) from " << source_path);
+  }
+  for (const auto& dev : devices) {
+    if (dev.path.empty() || dev.key_to_command.empty()) {
+      LOGW("input-map: skipped device with no path or bindings");
+      continue;
+    }
+    g_input_device_threads.emplace_back(input_device_thread_main, dev);
+  }
+}
+
+static void join_input_map_threads() {
+  for (auto& t : g_input_device_threads) {
+    if (!t.joinable()) continue;
+    if (g_force_close_requested.load(std::memory_order_relaxed)) {
+      t.detach();
+    } else {
+      t.join();
+    }
+  }
+  g_input_device_threads.clear();
+}
+
 struct Context {
   SDK::CrDeviceHandle handle = 0;
   // add whatever shared state you need
@@ -3492,15 +3963,17 @@ int main(int argc, char **argv) {
   install_signal_handlers();
   block_sigint_in_this_thread();
 
-  std::string explicit_ip, explicit_mac, explicit_model, download_dir;
+  std::string explicit_host, explicit_mac, explicit_model, download_dir;
   bool verbose = false;
   std::string auth_user, auth_pass;
+  std::string input_map_path;
+  bool input_map_explicit = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "--ip" && i + 1 < argc) explicit_ip = argv[++i];
+    if (a == "--host" && i + 1 < argc) explicit_host = argv[++i];
     else if (a == "--mac" && i + 1 < argc) explicit_mac = argv[++i];
-    else if (a == "--dir" && i + 1 < argc) download_dir = argv[++i];
+    else if (a == "--sync-dir" && i + 1 < argc) download_dir = argv[++i];
     else if (a == "--verbose" || a == "-v") verbose = true;
     else if (a == "--cmd" && i + 1 < argc) g_post_cmd = argv[++i];
     else if (a == "--model" && i + 1 < argc) explicit_model = argv[++i];
@@ -3511,17 +3984,52 @@ int main(int argc, char **argv) {
     }
     else if (a == "--user" && i + 1 < argc) auth_user = argv[++i];
     else if (a == "--pass" && i + 1 < argc) auth_pass = argv[++i];
+    else if (a == "--input-map" && i + 1 < argc) {
+      input_map_path = argv[++i];
+      input_map_explicit = true;
+    }
   }
+
+  const bool sync_dir_configured = !download_dir.empty();
 
 #ifdef SONSHELL_HEADLESS
   LOGW("Live view disabled: SonShell built with -DSONSHELL_HEADLESS=ON (OpenCV omitted)");
 #endif
 
+  std::string resolved_input_map;
+  if (!input_map_path.empty()) {
+    resolved_input_map = expand_user_path(input_map_path);
+  } else {
+    std::string fallback = default_input_map_path();
+    if (!fallback.empty() && std::filesystem::exists(fallback)) {
+      resolved_input_map = fallback;
+    }
+  }
+
+  if (!resolved_input_map.empty()) {
+    if (!std::filesystem::exists(resolved_input_map)) {
+      if (input_map_explicit) {
+        LOGW("input-map: file not found: " << resolved_input_map);
+      }
+    } else {
+      std::vector<InputMapDevice> devices;
+      std::string parse_error;
+      if (parse_input_map_config(resolved_input_map, devices, parse_error)) {
+        start_input_map_threads(devices, resolved_input_map);
+      } else {
+        LOGE(parse_error);
+      }
+    }
+  }
+
   if (!SDK::Init()) {
     LOGE( "Init failed" );
+    g_stop.store(true, std::memory_order_relaxed);
+    join_input_map_threads();
     return 1;
   }
   g_download_dir = download_dir;
+  g_auto_sync_enabled.store(sync_dir_configured, std::memory_order_relaxed);
 
   auto cleanup_sdk = []() {
     g_shutting_down.store(true);
@@ -3532,6 +4040,7 @@ int main(int argc, char **argv) {
 
   // Main connect loop (keepalive-aware)
   while (!g_stop.load()) {
+    maybe_log_force_close();
     SDK::CrDeviceHandle handle = 0;
     const SDK::ICrCameraObjectInfo *selected = nullptr;
     SDK::ICrEnumCameraObjectInfo *enum_list = nullptr;
@@ -3541,12 +4050,14 @@ int main(int argc, char **argv) {
     cb.last_error_code = 0;
     g_reconnect.store(false);
 
-    bool ok = try_connect_once(explicit_ip, explicit_mac, explicit_model, download_dir, verbose, auth_user, auth_pass, cb, handle, selected, enum_list, created);
+    bool ok = try_connect_once(explicit_host, explicit_mac, explicit_model, download_dir, verbose, auth_user, auth_pass, cb, handle, selected, enum_list, created);
     
     if (!ok) {
       disconnect_and_release(handle, created, enum_list);
       if (g_keepalive.count() == 0) {
 	LOGE( "Exiting (no keepalive)" );
+        g_stop.store(true, std::memory_order_relaxed);
+        join_input_map_threads();
 	cleanup_sdk();
 	return 2;
       }
@@ -3557,6 +4068,9 @@ int main(int argc, char **argv) {
       interruptible_sleep(g_keepalive);
       block_sigint_in_this_thread();
       
+      if (g_stop.load(std::memory_order_relaxed) || g_force_close_requested.load(std::memory_order_relaxed)) {
+        break;
+      }
       continue;
     }
 
@@ -3622,46 +4136,10 @@ int main(int argc, char **argv) {
 	  return cmd.at("help")(args);
 	}},
 	{"shoot", [&](auto const& args)->int {
-	  //if (args.size() < 2) { std::cerr << "usage: connect <host>\n"; return 2; }
-	  ctx.handle = handle;
-
-	  if (verbose) LOGI("Capture image...");
-
-	  SDK::CrDeviceProperty s1;
-	  s1.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
-	  s1.SetValueType(SDK::CrDataType::CrDataType_UInt16);
-	  s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
-	  auto s1_lock_err = SDK::SetDeviceProperty(handle, &s1);
-	  if (s1_lock_err != SDK::CrError_None) {
-	    unsigned code = static_cast<unsigned>(s1_lock_err);
-	    LOGE("Failed to half-press shutter: " << crsdk_err::error_to_name(s1_lock_err) << " (0x" << std::hex << code << std::dec << ")");
+	  (void)args;
+	  if (!trigger_full_shutter_press(handle, verbose, "shoot")) {
 	    return 2;
 	  }
-	  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-	  if (verbose) LOGI("Shutter down");
-	  auto down_err = SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Down);
-	  if (down_err != SDK::CrError_None) {
-	    unsigned code = static_cast<unsigned>(down_err);
-	    LOGE("Shutter down failed: " << crsdk_err::error_to_name(down_err) << " (0x" << std::hex << code << std::dec << ")");
-	  }
-	  std::this_thread::sleep_for(std::chrono::milliseconds(35));
-
-	  if (verbose) LOGI("Shutter up");
-	  auto up_err = SDK::SendCommand(handle, SDK::CrCommandId::CrCommandId_Release, SDK::CrCommandParam_Up);
-	  if (up_err != SDK::CrError_None) {
-	    unsigned code = static_cast<unsigned>(up_err);
-	    LOGE("Shutter up failed: " << crsdk_err::error_to_name(up_err) << " (0x" << std::hex << code << std::dec << ")");
-	  }
-
-	  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-	  s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-	  auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
-	  if (s1_unlock_err != SDK::CrError_None) {
-	    unsigned code = static_cast<unsigned>(s1_unlock_err);
-	    LOGE("Failed to release half-press: " << crsdk_err::error_to_name(s1_unlock_err) << " (0x" << std::hex << code << std::dec << ")");
-	  }
-
 	  return 0;
 	}},
 	{"trigger", [&](auto const& args)->int {
@@ -3710,6 +4188,7 @@ int main(int argc, char **argv) {
 	    std::string a = args[1];
 	    std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c){ return std::tolower(c); });
 	    if (a == "on") {
+	      if (!ensure_sync_directory_configured("sync on")) return 2;
 	      bool was = g_auto_sync_enabled.exchange(true, std::memory_order_acq_rel);
 	      LOGI((was ? "Auto-sync already enabled." : "Auto-sync enabled."));
 	      return 0;
@@ -3771,6 +4250,10 @@ int main(int argc, char **argv) {
 	      try { n = std::max(1, std::stoi(args[1])); }
 	      catch (...) { LOGE("usage: sync [count|all]"); return 2; }
 	    }
+	  }
+
+	  if (!ensure_sync_directory_configured("sync")) {
+	    return 2;
 	  }
 	  
 	  bool expected_running = false;
@@ -3963,6 +4446,70 @@ int main(int argc, char **argv) {
 
 	  return 0;
 	}},
+        {"button", [&](auto const& args)->int {
+          if (args.size() < 2) {
+            LOGE("usage: button <dpad|playback|shutter|movie> ...");
+            return 2;
+          }
+          auto feature = args[1];
+          std::transform(feature.begin(), feature.end(), feature.begin(),
+                         [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+          if (feature == "dpad") {
+            if (args.size() < 3) {
+              LOGE("usage: button dpad left|right|up|down|center");
+              return 2;
+            }
+            auto direction = args[2];
+            std::transform(direction.begin(), direction.end(), direction.begin(),
+                           [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+            SDK::CrCameraButtonFunction button = SDK::CrCameraButtonFunction_LeftButton;
+            const char* label = "dpad left";
+            if (direction == "left") {
+              button = SDK::CrCameraButtonFunction_LeftButton;
+              label = "dpad left";
+            } else if (direction == "right") {
+              button = SDK::CrCameraButtonFunction_RightButton;
+              label = "dpad right";
+            } else if (direction == "up") {
+              button = SDK::CrCameraButtonFunction_UpButton;
+              label = "dpad up";
+            } else if (direction == "down") {
+              button = SDK::CrCameraButtonFunction_DownButton;
+              label = "dpad down";
+            } else if (direction == "center" || direction == "centre" || direction == "enter") {
+              button = SDK::CrCameraButtonFunction_EnterButton;
+              label = "dpad center";
+            } else {
+              LOGE("button: unknown direction '" << args[2] << "'; try 'button dpad left|right|up|down|center'");
+              return 2;
+            }
+            if (!tap_camera_button(handle, button, label)) {
+              return 2;
+            }
+            LOGI("button: tapped " << label << '.');
+            return 0;
+          } else if (feature == "playback") {
+            if (!tap_camera_button(handle, SDK::CrCameraButtonFunction_PlaybackButton, "playback")) {
+              return 2;
+            }
+            LOGI("button: tapped playback.");
+            return 0;
+          } else if (feature == "shutter") {
+            if (!trigger_full_shutter_press(handle, verbose, "button shutter")) {
+              return 2;
+            }
+            LOGI("button: tapped shutter.");
+            return 0;
+          } else if (feature == "movie") {
+            bool ok = send_movie_record_button_press(handle, std::chrono::milliseconds(200), verbose);
+            if (!ok) return 2;
+            LOGI("button: tapped movie.");
+            return 0;
+          } else {
+            LOGE("button: unknown target '" << args[1] << "'; try 'button dpad ...', 'button playback', 'button shutter', or 'button movie'");
+            return 2;
+          }
+        }},
 	{"monitor", [&](auto const& args)->int {
 	#ifdef SONSHELL_HEADLESS
 	  (void)args;
@@ -4049,6 +4596,23 @@ int main(int argc, char **argv) {
 	}},
       };
 
+      auto run_cli_command = [&](const std::vector<std::string>& args) -> int {
+	if (args.empty()) return 0;
+	auto it = cmd.find(args[0]);
+	if (it == cmd.end()) {
+	  LOGE("Unknown command: " << args[0]);
+	  return 2;
+	}
+	std::lock_guard<std::mutex> exec_lk(g_command_exec_mutex);
+	return it->second(args);
+      };
+
+      {
+	std::lock_guard<std::mutex> lk(g_command_runner_mutex);
+	g_command_runner = run_cli_command;
+      }
+      g_command_runner_cv.notify_all();
+
       while (!g_stop.load(std::memory_order_relaxed) && !g_reconnect.load(std::memory_order_relaxed)) {
 
         // Print logs that arrived just before we read; NO refresh here to avoid double prompt
@@ -4095,12 +4659,7 @@ int main(int argc, char **argv) {
 	history(hist, &ev, H_ENTER, line.c_str());
 
 	auto args = tokenize(line);
-	auto it = cmd.find(args[0]);
-	if (it == cmd.end()) {
-	  LOGE("Unknown command: " << args[0]);
-	  continue;
-	}
-	int rc = it->second(args);
+	int rc = run_cli_command(args);
 	if (rc == 99) break;  // already set g_stop above
 	
 	// Print logs produced by the command; let el_gets() render the next prompt once.
@@ -4113,6 +4672,11 @@ int main(int argc, char **argv) {
       el_end(el);
 
       g_repl_active.store(false, std::memory_order_relaxed);
+      {
+	std::lock_guard<std::mutex> lk(g_command_runner_mutex);
+	g_command_runner = nullptr;
+      }
+      g_command_runner_cv.notify_all();
 
       // Ensure the prompt line is cleared so shutdown logs start cleanly
       std::fputs("\r\033[K", stdout);
@@ -4139,7 +4703,12 @@ int main(int argc, char **argv) {
     
     // 3) Join any download workers.
     for (auto &t : g_downloadThreads) {
-      if (t.joinable()) t.join();
+      if (!t.joinable()) continue;
+      if (g_force_close_requested.load(std::memory_order_relaxed)) {
+        t.detach();
+      } else {
+        t.join();
+      }
     }
     g_downloadThreads.clear();
     
@@ -4162,11 +4731,19 @@ int main(int argc, char **argv) {
     block_sigint_in_this_thread();
   }
 
+  maybe_log_force_close();
   LOGI( "Shutting down..." );
   monitor_stop();
   for (auto &t : g_downloadThreads) {
-    if (t.joinable()) t.join();
+    if (!t.joinable()) continue;
+    if (g_force_close_requested.load(std::memory_order_relaxed)) {
+      t.detach();
+    } else {
+      t.join();
+    }
   }
+  g_stop.store(true, std::memory_order_relaxed);
+  join_input_map_threads();
   cleanup_sdk();
   return 0;
 }

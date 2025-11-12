@@ -35,9 +35,9 @@ sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-d
    ```bash
    cmake --build build --config Release
    ```
-3. Run it (start with enumeration and let SonShell pick the download folder):
+3. Run it (pass `--sync-dir` so downloads have a destination):
    ```bash
-   ./build/sonshell --dir "$PWD/photos" --keepalive 3000
+   ./build/sonshell --sync-dir "$PWD/photos" --keepalive 3000
    ```
 
 ### Headless builds
@@ -52,8 +52,8 @@ The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `
 
 | Option | Description |
 | --- | --- |
-| `--dir <path>` | Directory where downloads are stored. If omitted, files land in the working directory; providing an explicit folder is strongly recommended for sync features. |
-| `--ip <addr>` | Connect directly to a camera at the given IPv4 address (e.g. `192.168.1.1`). Skipped when enumerating automatically. |
+| `--sync-dir <path>` | Directory where downloads are mirrored. Auto-sync stays disabled unless this flag is provided. |
+| `--host <addr>` | Connect directly to a camera at the given IPv4 address (e.g. `192.168.1.1`). Skipped when enumerating automatically. |
 | `--mac <hex:mac>` | Optional MAC address for direct-IP connects (`aa:bb:cc:dd:ee:ff`). Used to seed the SDK’s Ethernet object. |
 | `--model <name>` | Optional camera model hint for direct-IP connects (e.g. `a7r5`, `fx3`, `zve1`). Enumeration ignores this flag and always picks the first discovered device. |
 | `--user <name>` | Username for cameras with Access Auth enabled. |
@@ -62,7 +62,7 @@ The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `
 | `--keepalive <ms>` | Reconnection delay after failure or disconnect. `0` disables retry (SonShell exits on error). |
 | `--verbose`, `-v` | Print detailed property-change logs and transfer progress from the SDK callbacks. |
 
-If no `--ip` is provided SonShell enumerates available cameras and uses the first match. A fingerprint of the successful connection is cached under `~/.cache/sonshell/fp_enumerated.bin` so subsequent launches pair faster.
+If no `--host` is provided SonShell enumerates available cameras and uses the first match. Without `--sync-dir`, transfers remain off until you restart with a destination folder. A fingerprint of the successful connection is cached under `~/.cache/sonshell/fp_enumerated.bin` so subsequent launches pair faster.
 
 ---
 
@@ -114,10 +114,28 @@ The `scripts/` directory contains helper utilities that SonShell can trigger thr
 | `exposure` | `exposure show`, `mode <value>`, `iso <value>`, `aperture <f-number>`, `shutter <value>`, `comp <value>` (aliases: `sensitivity`, `f`, `fnumber`, `speed`, `compensation`, `ev`) | Inspect or change exposure parameters. Values accept friendly forms like `manual`, `auto`, `f/2.8`, `1/125`, `0.3`, or `1/3`. SonShell surfaces hints when the camera mode dial must change. | – |
 | `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close it with `monitor stop`. | – |
 | `record` | `record start`, `record stop` | Toggle movie recording (simulates the camera’s red button). Confirms state when possible. | – |
+| `button` | `button dpad left/right/up/down/center`, `button playback`, `button shutter`, `button movie` | Remotely tap d-pad directions, playback toggle, the top shutter button, or the dedicated movie button. | – |
 | `power` | `power off` | Request a remote power-down. Enable “Remote Power OFF/ON” plus “Network Standby” on the camera for best results. | – |
 | `quit`, `exit` | – | Leave SonShell. Also triggered by `Ctrl+D`. | `Ctrl+D` |
 
 Automatic downloads queue in worker threads. Newly captured files are renamed to avoid clashes (e.g. `DSC01234.JPG`, `DSC01234_1.JPG`, …) unless you run a manual `sync`, in which case the original names and folder layout are preserved.
+
+---
+
+## Hardware Shortcut Mapping
+
+You can map Linux input events (gamepads, keypads, foot pedals) to SonShell commands. Create `~/.config/sonshell/input-map.yaml` (or pass a custom file with `--input-map /path/config.yaml`) and describe devices plus bindings:
+
+```yaml
+input:
+  devices:
+    - path: /dev/input/event2
+      bindings:
+        KEY_LEFT: button dpad left
+        KEY_RIGHT: button dpad right
+```
+
+Each device entry watches one `/dev/input/eventX` node and fires the listed commands on key-down. Key names accept common `KEY_*` / `BTN_*` symbols or numeric codes (decimal or `0x` prefixed). Commands go through the regular REPL pipeline, so logging, hooks, and safety checks apply. Make sure your user can read the chosen device (e.g., add a udev rule or run SonShell with the proper group).
 
 ---
 

@@ -1,0 +1,6 @@
+input:
+  devices:
+    - path: /dev/input/event2
+      bindings:
+        KEY_LEFT: button dpad left
+        KEY_RIGHT: button dpad right
