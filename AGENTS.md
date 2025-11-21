@@ -4,6 +4,8 @@
 - `src/main.cpp` is the entire runtime (SDK bridge, REPL, live view, hooks); keep additions small and well-fenced.
 - Root CMake glue (`CMakeLists.txt`, `INSTALL.md`) defines the build; `build*/` stays untracked while automation lives in `scripts/`.
 - The Python generators in `tools/` refresh the SDK-derived headers next to `main.cpp`; rerun them whenever Sony ships new enums.
+- You can find the Sony SDK API in the `docs/CrSDK_v2.00.00_api` subdirectory.
+- You can find a Sony CLI sample/reference app in the `docs/CrSDK_v2.00.00_app` subdirectory
 
 ## Build, Test & Development Commands
 - Configure with `cmake -S . -B build -DSONY_SDK_DIR="/abs/path/CrSDK_v2.00.00_20250805a_Linux64PC"` (use `~/Projects/a6700/sdk/CrSDK_v2.00.00_20250805a_Linux64PC` when unset) and add `-DSONSHELL_HEADLESS=ON` if GTK/OpenCV are absent.

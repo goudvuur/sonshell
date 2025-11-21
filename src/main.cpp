@@ -1370,6 +1370,7 @@ static void log_command_overview() {
   LOGI("  record start|stop    Toggle movie recording");
   LOGI("  button dpad ...      Tap the rear d-pad (left/right/up/down/center) buttons");
   LOGI("  button playback      Toggle the camera playback button");
+  LOGI("  button menu          Open the camera menu (rear Menu button)");
   LOGI("  button shutter|movie Tap the top shutter or movie buttons");
   LOGI("  power off            Ask the camera to power down (half-pressing the shutter will wake it up)");
   LOGI("  quit | exit          Leave SonShell");
@@ -4448,7 +4449,7 @@ int main(int argc, char **argv) {
 	}},
         {"button", [&](auto const& args)->int {
           if (args.size() < 2) {
-            LOGE("usage: button <dpad|playback|shutter|movie> ...");
+            LOGE("usage: button <dpad|playback|menu|shutter|movie> ...");
             return 2;
           }
           auto feature = args[1];
@@ -4494,6 +4495,12 @@ int main(int argc, char **argv) {
             }
             LOGI("button: tapped playback.");
             return 0;
+          } else if (feature == "menu") {
+            if (!tap_camera_button(handle, SDK::CrCameraButtonFunction_MenuButton, "menu")) {
+              return 2;
+            }
+            LOGI("button: tapped menu.");
+            return 0;
           } else if (feature == "shutter") {
             if (!trigger_full_shutter_press(handle, verbose, "button shutter")) {
               return 2;
@@ -4506,7 +4513,7 @@ int main(int argc, char **argv) {
             LOGI("button: tapped movie.");
             return 0;
           } else {
-            LOGE("button: unknown target '" << args[1] << "'; try 'button dpad ...', 'button playback', 'button shutter', or 'button movie'");
+            LOGE("button: unknown target '" << args[1] << "'; try 'button dpad ...', 'button playback', 'button menu', 'button shutter', or 'button movie'");
             return 2;
           }
         }},

@@ -114,7 +114,7 @@ The `scripts/` directory contains helper utilities that SonShell can trigger thr
 | `exposure` | `exposure show`, `mode <value>`, `iso <value>`, `aperture <f-number>`, `shutter <value>`, `comp <value>` (aliases: `sensitivity`, `f`, `fnumber`, `speed`, `compensation`, `ev`) | Inspect or change exposure parameters. Values accept friendly forms like `manual`, `auto`, `f/2.8`, `1/125`, `0.3`, or `1/3`. SonShell surfaces hints when the camera mode dial must change. | – |
 | `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close it with `monitor stop`. | – |
 | `record` | `record start`, `record stop` | Toggle movie recording (simulates the camera’s red button). Confirms state when possible. | – |
-| `button` | `button dpad left/right/up/down/center`, `button playback`, `button shutter`, `button movie` | Remotely tap d-pad directions, playback toggle, the top shutter button, or the dedicated movie button. | – |
+| `button` | `button dpad left/right/up/down/center`, `button playback`, `button menu`, `button shutter`, `button movie` | Remotely tap d-pad directions, playback toggle, the rear Menu key, the top shutter button, or the dedicated movie button. | – |
 | `power` | `power off` | Request a remote power-down. Enable “Remote Power OFF/ON” plus “Network Standby” on the camera for best results. | – |
 | `quit`, `exit` | – | Leave SonShell. Also triggered by `Ctrl+D`. | `Ctrl+D` |
 
