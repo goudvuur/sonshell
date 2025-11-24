@@ -61,6 +61,7 @@ The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `
 | `--cmd <path>` | Executable/script that SonShell calls for every file event (new downloads, syncs, rating changes, …). Arguments: `<path> <mode> <operation> [new] [old]`. Runs asynchronously; SonShell does not wait for completion. |
 | `--keepalive <ms>` | Reconnection delay after failure or disconnect. `0` disables retry (SonShell exits on error). |
 | `--verbose`, `-v` | Print detailed property-change logs and transfer progress from the SDK callbacks. |
+| `--silent` | Suppress all logging while not connected (useful to avoid keepalive spam). |
 
 If no `--host` is provided SonShell enumerates available cameras and uses the first match. Without `--sync-dir`, transfers remain off until you restart with a destination folder. A fingerprint of the successful connection is cached under `~/.cache/sonshell/fp_enumerated.bin` so subsequent launches pair faster.
 
@@ -136,6 +137,16 @@ input:
 ```
 
 Each device entry watches one `/dev/input/eventX` node and fires the listed commands on key-down. Key names accept common `KEY_*` / `BTN_*` symbols or numeric codes (decimal or `0x` prefixed). Commands go through the regular REPL pipeline, so logging, hooks, and safety checks apply. Make sure your user can read the chosen device (e.g., add a udev rule or run SonShell with the proper group).
+
+You can also add startup commands in the same config file:
+
+```yaml
+init:
+  commands:
+    - sync on
+```
+
+These commands run once right after SonShell connects to a camera.
 
 ---
 

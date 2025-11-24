@@ -79,6 +79,8 @@ static std::atomic<bool> g_sync_all{false};
 static std::atomic<bool> g_sync_abort{false};
 static std::atomic<bool> g_sync_running{false};
 static std::atomic<bool> g_auto_sync_enabled{false};
+static std::vector<std::vector<std::string>> g_init_commands;
+static std::atomic<bool> g_init_commands_ran{false};
 static std::atomic<bool> g_sigint_requested{false};
 static std::atomic<bool> g_shutdown_requested{false};
 static std::atomic<bool> g_force_close_requested{false};
@@ -94,6 +96,8 @@ static std::atomic<std::uint64_t> g_last_contents_update_slot1{0};
 static std::atomic<std::uint64_t> g_last_contents_update_slot2{0};
 static std::mutex g_rating_mtx;
 static std::unordered_map<std::uint64_t, int> g_last_known_ratings;
+static std::atomic<bool> g_silent_no_connect{false};
+static std::atomic<bool> g_connected_for_logs{false};
 
 struct InputMapDevice {
   std::string path;
@@ -1238,6 +1242,10 @@ static std::deque<LogItem> g_log_q;
 
 // Enqueue a message from any thread.
 static inline void log_enqueue(LogLevel lvl, std::string msg) {
+  if (g_silent_no_connect.load(std::memory_order_relaxed) &&
+      !g_connected_for_logs.load(std::memory_order_relaxed)) {
+    return;
+  }
   if (!g_repl_active.load(std::memory_order_relaxed)) {
     std::ostream& os = (lvl == LogLevel::Error) ? std::cerr : std::cout;
     write_log_line(lvl, msg, os);
@@ -1370,6 +1378,7 @@ static void log_command_overview() {
   LOGI("  record start|stop    Toggle movie recording");
   LOGI("  button dpad ...      Tap the rear d-pad (left/right/up/down/center) buttons");
   LOGI("  button playback      Toggle the camera playback button");
+  LOGI("  button fn            Press the rear Fn (function) button");
   LOGI("  button delete        Tap the rear trash/delete button");
   LOGI("  button menu          Open the camera menu (rear Menu button)");
   LOGI("  button shutter|movie Tap the top shutter or movie buttons");
@@ -3724,7 +3733,8 @@ static bool parse_key_code_token(const std::string& raw, int& code_out) {
 }
 
 static bool parse_input_map_config(const std::string& path,
-                                   std::vector<InputMapDevice>& out,
+                                   std::vector<InputMapDevice>& devices_out,
+                                   std::vector<std::vector<std::string>>& init_cmds_out,
                                    std::string& error) {
   std::ifstream in(path);
   if (!in) {
@@ -3735,6 +3745,9 @@ static bool parse_input_map_config(const std::string& path,
   InputMapDevice current;
   bool device_active = false;
   bool in_bindings = false;
+  bool in_init_commands = false;
+  bool in_input_section = false;
+  bool in_init_section = false;
   int line_no = 0;
 
   auto finalize_device = [&]() -> bool {
@@ -3743,7 +3756,7 @@ static bool parse_input_map_config(const std::string& path,
       error = "input-map: device missing 'path:' entry";
       return false;
     }
-    out.push_back(current);
+    devices_out.push_back(current);
     current = InputMapDevice{};
     device_active = false;
     in_bindings = false;
@@ -3774,12 +3787,26 @@ static bool parse_input_map_config(const std::string& path,
     if (content.empty()) continue;
 
     if (indent == 0 && content == "input:") {
+      in_input_section = true;
+      in_init_section = false;
+      in_init_commands = false;
       continue;
     }
-    if (indent == 2 && content == "devices:") {
+    if (indent == 0 && content == "init:") {
+      in_init_section = true;
+      in_input_section = false;
+      in_bindings = false;
+      if (!finalize_device()) return false;
       continue;
     }
-    if (indent == 4 && list_item) {
+    if (indent == 2 && in_input_section && content == "devices:") {
+      continue;
+    }
+    if (indent == 2 && in_init_section && content == "commands:") {
+      in_init_commands = true;
+      continue;
+    }
+    if (indent == 4 && list_item && in_input_section) {
       if (!finalize_device()) return false;
       device_active = true;
       in_bindings = false;
@@ -3797,12 +3824,39 @@ static bool parse_input_map_config(const std::string& path,
       }
       continue;
     }
+    if (in_init_commands) {
+      if (!list_item && indent < 4) {
+        error = "input-map: expected list item under init.commands (line " + std::to_string(line_no) + ")";
+        return false;
+      }
+      std::string cmd = content;
+      if (cmd.empty()) {
+        error = "input-map: empty init command on line " + std::to_string(line_no);
+        return false;
+      }
+      // strip quotes if present
+      if (cmd.front() == '"' && cmd.back() == '"' && cmd.size() >= 2) {
+        cmd = cmd.substr(1, cmd.size() - 2);
+      }
+      auto tokens = tokenize(cmd);
+      if (tokens.empty()) {
+        error = "input-map: init command parses to zero tokens (line " + std::to_string(line_no) + ")";
+        return false;
+      }
+      init_cmds_out.push_back(tokens);
+      continue;
+    }
+
     if (!device_active) {
       error = "input-map: device attributes appeared before '- path:' (line " + std::to_string(line_no) + ")";
       return false;
     }
 
     if (indent >= 6 && indent < 8) {
+      if (!in_input_section) {
+        error = "input-map: unexpected key outside 'input' section (line " + std::to_string(line_no) + ")";
+        return false;
+      }
       std::string key, value;
       if (!split_key_value_line(content, key, value)) {
         error = "input-map: expected 'key: value' on line " + std::to_string(line_no);
@@ -3852,8 +3906,8 @@ static bool parse_input_map_config(const std::string& path,
   }
 
   if (!finalize_device()) return false;
-  if (out.empty()) {
-    error = "input-map: no devices defined in " + path;
+  if (devices_out.empty() && init_cmds_out.empty()) {
+    error = "input-map: no devices or init commands defined in " + path;
     return false;
   }
   return true;
@@ -3875,18 +3929,37 @@ static int run_input_mapped_command(const std::vector<std::string>& tokens) {
   return runner(tokens);
 }
 
+static void run_init_commands_once(const std::function<int(const std::vector<std::string>&)>& exec_fn) {
+  if (!exec_fn) return;
+  bool already = g_init_commands_ran.exchange(true, std::memory_order_acq_rel);
+  if (already) return;
+  for (const auto& cmd : g_init_commands) {
+    if (cmd.empty()) continue;
+    int rc = exec_fn(cmd);
+    if (rc != 0) {
+      LOGW("init: command '" << join_tokens(cmd) << "' returned " << rc);
+    }
+  }
+}
+
 static void input_device_thread_main(InputMapDevice device) {
   const std::string label = device.path.empty() ? "<unknown>" : device.path;
   constexpr std::chrono::milliseconds kRetryDelay{1000};
+  bool missing_logged = false;
 
   while (!g_stop.load(std::memory_order_relaxed)) {
     int fd = open(device.path.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
       int err = errno;
-      LOGE("input-map: failed to open " << label << ": " << std::strerror(err));
+      if (!missing_logged) {
+        LOGW("input-map: waiting for " << label << " (" << std::strerror(err) << ")");
+        missing_logged = true;
+      }
       std::this_thread::sleep_for(kRetryDelay);
       continue;
     }
+    missing_logged = false;
+
     LOGI("input-map: listening on " << label << " (" << device.key_to_command.size() << " bindings)");
 
     while (!g_stop.load(std::memory_order_relaxed)) {
@@ -3898,6 +3971,10 @@ static void input_device_thread_main(InputMapDevice device) {
         break;
       }
       if (pr == 0) continue;
+      if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        LOGW("input-map: device " << label << " disappeared (poll flags " << std::hex << pfd.revents << std::dec << ")");
+        break;
+      }
       if (!(pfd.revents & POLLIN)) continue;
 
       struct input_event ev {};
@@ -3905,6 +3982,10 @@ static void input_device_thread_main(InputMapDevice device) {
       if (n < 0) {
         if (errno == EINTR || errno == EAGAIN) continue;
         LOGE("input-map: read failed on " << label << ": " << std::strerror(errno));
+        break;
+      }
+      if (n == 0) {
+        LOGW("input-map: device " << label << " disconnected (EOF)");
         break;
       }
       if (n != sizeof(ev)) continue;
@@ -3970,6 +4051,7 @@ int main(int argc, char **argv) {
   std::string auth_user, auth_pass;
   std::string input_map_path;
   bool input_map_explicit = false;
+  bool silent_no_connect = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -3990,7 +4072,11 @@ int main(int argc, char **argv) {
       input_map_path = argv[++i];
       input_map_explicit = true;
     }
+    else if (a == "--silent") {
+      silent_no_connect = true;
+    }
   }
+  g_silent_no_connect.store(silent_no_connect, std::memory_order_relaxed);
 
   const bool sync_dir_configured = !download_dir.empty();
 
@@ -4015,8 +4101,10 @@ int main(int argc, char **argv) {
       }
     } else {
       std::vector<InputMapDevice> devices;
+      std::vector<std::vector<std::string>> init_cmds;
       std::string parse_error;
-      if (parse_input_map_config(resolved_input_map, devices, parse_error)) {
+      if (parse_input_map_config(resolved_input_map, devices, init_cmds, parse_error)) {
+        g_init_commands = std::move(init_cmds);
         start_input_map_threads(devices, resolved_input_map);
       } else {
         LOGE(parse_error);
@@ -4043,6 +4131,7 @@ int main(int argc, char **argv) {
   // Main connect loop (keepalive-aware)
   while (!g_stop.load()) {
     maybe_log_force_close();
+    g_connected_for_logs.store(false, std::memory_order_relaxed);
     SDK::CrDeviceHandle handle = 0;
     const SDK::ICrCameraObjectInfo *selected = nullptr;
     SDK::ICrEnumCameraObjectInfo *enum_list = nullptr;
@@ -4075,6 +4164,7 @@ int main(int argc, char **argv) {
       }
       continue;
     }
+    g_connected_for_logs.store(true, std::memory_order_relaxed);
 
     // Create wake pipe once per connection (or do it once at program start)
     if (g_wake_pipe[0] == -1) {
@@ -4450,7 +4540,7 @@ int main(int argc, char **argv) {
 	}},
         {"button", [&](auto const& args)->int {
           if (args.size() < 2) {
-            LOGE("usage: button <dpad|playback|delete|menu|shutter|movie> ...");
+            LOGE("usage: button <dpad|playback|fn|delete|menu|shutter|movie> ...");
             return 2;
           }
           auto feature = args[1];
@@ -4504,6 +4594,12 @@ int main(int argc, char **argv) {
             }
             LOGI("button: tapped delete (C3 binding).");
             return 0;
+          } else if (feature == "fn") {
+            if (!tap_camera_button(handle, SDK::CrCameraButtonFunction_FnButton, "fn")) {
+              return 2;
+            }
+            LOGI("button: tapped fn.");
+            return 0;
           } else if (feature == "menu") {
             if (!tap_camera_button(handle, SDK::CrCameraButtonFunction_MenuButton, "menu")) {
               return 2;
@@ -4522,7 +4618,8 @@ int main(int argc, char **argv) {
             LOGI("button: tapped movie.");
             return 0;
           } else {
-            LOGE("button: unknown target '" << args[1] << "'; try 'button dpad ...', 'button playback', 'button delete', 'button menu', 'button shutter', or 'button movie'");
+            LOGE("button: unknown target '" << args[1]
+                 << "'; try 'button dpad ...', 'button playback', 'button fn', 'button delete', 'button menu', 'button shutter', or 'button movie'");
             return 2;
           }
         }},
@@ -4629,6 +4726,9 @@ int main(int argc, char **argv) {
       }
       g_command_runner_cv.notify_all();
 
+      // Fire optional init commands once per program run (after first connect).
+      run_init_commands_once(run_cli_command);
+
       while (!g_stop.load(std::memory_order_relaxed) && !g_reconnect.load(std::memory_order_relaxed)) {
 
         // Print logs that arrived just before we read; NO refresh here to avoid double prompt
@@ -4716,6 +4816,7 @@ int main(int argc, char **argv) {
     // 2) Now log and disconnect the camera; no prompt can appear anymore.
     if (verbose) LOGI( "Shutting down connection..." );
     disconnect_and_release(handle, created, enum_list);
+    g_connected_for_logs.store(false, std::memory_order_relaxed);
     
     // 3) Join any download workers.
     for (auto &t : g_downloadThreads) {
