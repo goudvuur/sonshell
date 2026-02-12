@@ -39,6 +39,7 @@ sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-d
    ```bash
    ./build/sonshell --sync-dir "$PWD/photos" --keepalive 3000
    ```
+   Once connected, run `sync on` in the REPL to start automatic downloads; otherwise use `sync`/`sync all` manually.
 
 ### Headless builds
 
@@ -52,7 +53,7 @@ The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `
 
 | Option | Description |
 | --- | --- |
-| `--sync-dir <path>` | Directory where downloads are mirrored. Auto-sync stays disabled unless this flag is provided. |
+| `--sync-dir <path>` | Directory where downloads are mirrored. Auto-download now stays off at boot even with this flag; run `sync on` to enable. |
 | `--host <addr>` | Connect directly to a camera at the given IPv4 address (e.g. `192.168.1.1`). Skipped when enumerating automatically. |
 | `--mac <hex:mac>` | Optional MAC address for direct-IP connects (`aa:bb:cc:dd:ee:ff`). Used to seed the SDK’s Ethernet object. |
 | `--model <name>` | Optional camera model hint for direct-IP connects (e.g. `a7r5`, `fx3`, `zve1`). Enumeration ignores this flag and always picks the first discovered device. |
@@ -63,7 +64,7 @@ The build copies `libCr_*`, the adapter modules, and Sony’s OpenCV libs into `
 | `--verbose`, `-v` | Print detailed property-change logs and transfer progress from the SDK callbacks. |
 | `--silent` | Suppress all logging while not connected (useful to avoid keepalive spam). |
 
-If no `--host` is provided SonShell enumerates available cameras and uses the first match. Without `--sync-dir`, transfers remain off until you restart with a destination folder. A fingerprint of the successful connection is cached under `~/.cache/sonshell/fp_enumerated.bin` so subsequent launches pair faster.
+If no `--host` is provided SonShell enumerates available cameras and uses the first match. Without `--sync-dir`, transfers remain off until you restart with a destination folder; with `--sync-dir`, automatic downloads still wait for `sync on` before firing. A fingerprint of the successful connection is cached under `~/.cache/sonshell/fp_enumerated.bin` so subsequent launches pair faster.
 
 ---
 

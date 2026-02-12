@@ -4119,7 +4119,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   g_download_dir = download_dir;
-  g_auto_sync_enabled.store(sync_dir_configured, std::memory_order_relaxed);
+  g_auto_sync_enabled.store(false, std::memory_order_relaxed);  // require explicit "sync on" even when --sync-dir is set
 
   auto cleanup_sdk = []() {
     g_shutting_down.store(true);
