@@ -966,6 +966,53 @@ static PropertyValue fetch_property(SDK::CrDeviceHandle handle, CrInt32u code) {
   return out;
 }
 
+static CrInt32u contents_update_property_code(SDK::CrSlotNumber slot) {
+  return (slot == SDK::CrSlotNumber_Slot2)
+             ? SDK::CrDeviceProperty_MediaSLOT2_ContentsInfoListUpdateTime
+             : SDK::CrDeviceProperty_MediaSLOT1_ContentsInfoListUpdateTime;
+}
+
+static std::atomic<std::uint64_t>& last_contents_update_marker(SDK::CrSlotNumber slot) {
+  return (slot == SDK::CrSlotNumber_Slot2) ? g_last_contents_update_slot2
+                                           : g_last_contents_update_slot1;
+}
+
+static std::uint64_t wait_for_contents_list_refresh(SDK::CrDeviceHandle handle,
+                                                    SDK::CrSlotNumber slot,
+                                                    bool verbose,
+                                                    std::chrono::milliseconds timeout =
+                                                        std::chrono::milliseconds(1500),
+                                                    std::chrono::milliseconds retry_delay =
+                                                        std::chrono::milliseconds(150)) {
+  (void)verbose;
+  const CrInt32u update_code = contents_update_property_code(slot);
+  auto& last_seen = last_contents_update_marker(slot);
+
+  std::uint64_t update_time = 0;
+  const std::uint64_t previous_update = last_seen.load(std::memory_order_relaxed);
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+
+  while (!g_stop.load(std::memory_order_relaxed) && !g_shutting_down.load()) {
+    auto update_prop = fetch_property(handle, update_code);
+    if (!update_prop.supported) {
+      return 0;
+    }
+
+    update_time = static_cast<std::uint64_t>(update_prop.value);
+    if (update_time != 0 && update_time != previous_update) {
+      return update_time;
+    }
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
+
+    std::this_thread::sleep_for(retry_delay);
+  }
+
+  return update_time;
+}
+
 static std::string capture_mode_string(SDK::CrDeviceHandle handle,
                                        const SDK::CrContentsInfo &info,
                                        const SDK::CrContentsFile &file) {
@@ -3177,6 +3224,11 @@ public:
 	};
 
 	// -------- fetch & process --------
+	std::uint64_t observed_update_time = 0;
+	if (sync_star) {
+	  observed_update_time = wait_for_contents_list_refresh(handle, slot, verbose);
+	}
+
 	SDK::CrCaptureDate dummy_day{};
 	SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0;
 	SDK::CrError resList = SDK::GetRemoteTransferContentsInfoList(handle, slot,
@@ -3189,6 +3241,10 @@ public:
 		 << "contents found (slot=" << (int)slot << ")");
 	  }
 	  return;
+	}
+
+	if (sync_star && observed_update_time != 0) {
+	  last_contents_update_marker(slot).store(observed_update_time, std::memory_order_relaxed);
 	}
 
 	if (verbose) LOGI("[SYNC] slot " << (int)slot << ": processing contents list...");
