@@ -39,7 +39,7 @@
 - Repository focus: single-runtime CLI in `src/main.cpp` that bridges Sony Camera Remote SDK to a libedit REPL with hooks, sync workers, and optional OpenCV live view.
 - Build defaults: CMake configure via `cmake -S . -B build -DSONY_SDK_DIR="<sdk path>"` (use `~/Projects/a6700/sdk/CrSDK_v2.00.00_20250805a_Linux64PC` if unspecified); pass `-DSONSHELL_HEADLESS=ON` to skip OpenCV/GTK/live-view monitor.
 - Run habit: `./build/sonshell --sync-dir "$PWD/photos" --keepalive 3000` (+ optional `--cmd scripts/broadcast.sh` for hooks). Live view depends on copied SDK/OpenCV `.so` files sitting next to the binary.
-- Auto-sync default: even with `--sync-dir`, downloads stay off after boot until the user runs `sync on` (manual `sync` / `sync all` still work).
+- Auto-sync default: even with `--sync-dir`, downloads stay off after boot until the user runs `sync on` (manual `sync`, `sync all`, and `sync star` still work).
 - Scripts of note in `scripts/`: `broadcast.sh` (YAML fan-out for hook events), `debug.sh` (shows hook args), `find_adb.sh`, `to_android.sh`, `show*.sh`, `gmic.sh`.
-- Command surface (see README): REPL supports `status`, `shoot`, `focus`, `sync` variants, `exposure` subcommands, `monitor start/stop`, `record start/stop`, `button ...`, `power off`, `quit`. Auto-sync requires `--sync-dir`; fingerprint cache under `~/.cache/sonshell/`.
+- Command surface (see README): REPL supports `status`, `shoot`, `focus`, `sync` variants including `sync star`, `exposure` subcommands, `monitor start/stop`, `record start/stop`, `button ...`, `power off`, `quit`. Auto-sync requires `--sync-dir`; fingerprint cache under `~/.cache/sonshell/`.
 - Style reminders: C++17, 2-space indent, same-line braces, explicit `std::`, RAII (no raw SDK ownership), snake_case functions, globals as `g_*`, constants `kFoo`; include only what you use; prefer `<filesystem>`/`std::chrono`.

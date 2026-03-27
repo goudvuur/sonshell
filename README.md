@@ -39,7 +39,7 @@ sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-d
    ```bash
    ./build/sonshell --sync-dir "$PWD/photos" --keepalive 3000
    ```
-   Once connected, run `sync on` in the REPL to start automatic downloads; otherwise use `sync`/`sync all` manually.
+   Once connected, run `sync on` in the REPL to start automatic downloads; otherwise use `sync`, `sync all`, or `sync star` manually.
 
 ### Headless builds
 
@@ -112,7 +112,7 @@ The `scripts/` directory contains helper utilities that SonShell can trigger thr
 | `status` | – | Snapshot the body/lens info plus exposure, focus, and movie settings (`StatusSnapshot`). | – |
 | `shoot`, `trigger` | – | Full-press the shutter (locks S1, fires, releases). | `F1` (mapped in the REPL) |
 | `focus` | – | Half-press S1 long enough to autofocus, then release. | – |
-| `sync` | `sync`, `sync <N>`, `sync all`, `sync on`, `sync off`, `sync stop` | `sync`/`sync <N>` downloads the newest `N` items per slot (skips existing files). `sync all` mirrors every item, preserving Sony’s DCIM/day folder layout. `sync on/off` toggles automatic downloads triggered by new captures. `sync stop` cancels an active sync after the current file finishes (sends `CancelContentsTransfer` when the body supports it). | – |
+| `sync` | `sync`, `sync <N>`, `sync all`, `sync star`, `sync on`, `sync off`, `sync stop` | `sync`/`sync <N>` downloads the newest `N` items per slot (skips existing files). `sync all` mirrors every item, preserving Sony’s DCIM/day folder layout. `sync star` walks the full camera library and downloads only still-image contents whose in-camera rating is at least 1 star. `sync on/off` toggles automatic downloads triggered by new captures. `sync stop` cancels an active sync after the current file finishes (sends `CancelContentsTransfer` when the body supports it). | – |
 | `exposure` | `exposure show`, `mode <value>`, `iso <value>`, `aperture <f-number>`, `shutter <value>`, `comp <value>` (aliases: `sensitivity`, `f`, `fnumber`, `speed`, `compensation`, `ev`) | Inspect or change exposure parameters. Values accept friendly forms like `manual`, `auto`, `f/2.8`, `1/125`, `0.3`, or `1/3`. SonShell surfaces hints when the camera mode dial must change. | – |
 | `monitor` | `monitor start`, `monitor stop` | Start/stop the OpenCV live-view window. Close it with `monitor stop`. | – |
 | `record` | `record start`, `record stop` | Toggle movie recording (simulates the camera’s red button). Confirms state when possible. | – |
@@ -160,7 +160,7 @@ These commands run once right after SonShell connects to a camera.
 
 ## Features
 - Auto-connect via enumeration or direct IP, with fingerprint caching under `~/.cache/sonshell/` and optional username/password for Access Auth bodies.
-- Automatic download of new captures with unique local filenames plus manual `sync` flows (`latest N` or full mirror).
+- Automatic download of new captures with unique local filenames plus manual `sync` flows (`latest N`, full mirror, or starred still-image pull).
 - Unified hook callbacks (`--cmd`) fired on every file event (new captures, sync mirrors, edits like rating changes) with rich context including capture mode (`record/still/m`, `record/movie/cine_ei/sq`, …).
 - Exposure control commands that wrap Sony’s SDK properties, including helpful mode hints when the body rejects a setting.
 - Live-view streaming implemented with the SDK monitor APIs and bundled OpenCV 4.8 binaries.

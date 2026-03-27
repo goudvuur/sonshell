@@ -76,6 +76,7 @@ static std::atomic<bool> g_wake_pending{false};
 static std::atomic<int>  g_sync_tokens{0};   // how many callbacks are marked as boot-spawned
 static std::atomic<int>  g_sync_active{0};   // how many boot-spawned workers are still running
 static std::atomic<bool> g_sync_all{false};
+static std::atomic<bool> g_sync_star{false};
 static std::atomic<bool> g_sync_abort{false};
 static std::atomic<bool> g_sync_running{false};
 static std::atomic<bool> g_auto_sync_enabled{false};
@@ -181,6 +182,13 @@ static std::string contents_rating_to_string(SDK::CrContentsInfo_Rating rating) 
     case SDK::CrContentsInfo_Rating_5: return "5";
     default: return "Unknown";
   }
+}
+
+static bool contents_info_has_still_image(const SDK::CrContentsInfo& info) {
+  for (CrInt32u i = 0; i < info.filesNum; ++i) {
+    if (info.files[i].isImageParamExsist) return true;
+  }
+  return false;
 }
 
 static bool capture_date_equal(const SDK::CrCaptureDate &a,
@@ -1369,7 +1377,7 @@ static void log_command_overview() {
   LOGI("  exposure ...         Inspect or set exposure options; run 'exposure' for subcommands");
   LOGI("  shoot | trigger      Fire the shutter immediately (full press)");
   LOGI("  focus                Half-press + release to autofocus");
-  LOGI("  sync [N|all|on|off]  Pull the latest files or mirror all contents; 'sync stop' aborts");
+  LOGI("  sync [N|all|star|on|off]  Pull latest files, mirror all contents, or fetch starred stills; 'sync stop' aborts");
 #ifdef SONSHELL_HEADLESS
   LOGI("  monitor start|stop   (disabled in headless builds)");
 #else
@@ -3006,6 +3014,7 @@ public:
     }
 
     bool sync_all = is_sync && g_sync_all.load(std::memory_order_relaxed);
+    bool sync_star = is_sync && g_sync_star.load(std::memory_order_relaxed);
 
     if (!is_sync && !g_auto_sync_enabled.load(std::memory_order_acquire)) {
       if (verbose) {
@@ -3015,12 +3024,17 @@ public:
     }
 
     try {
-      g_downloadThreads.emplace_back([this, slotNumber, addSize, is_sync, sync_all]() {
-	if (is_sync) g_sync_active.fetch_add(1, std::memory_order_relaxed);
-	auto _boot_guard = std::unique_ptr<void, void(*)(void*)>{nullptr, [](void*) {
-	  if (g_sync_active.load(std::memory_order_relaxed) > 0)
-	    g_sync_active.fetch_sub(1, std::memory_order_relaxed);
-	}};
+      g_downloadThreads.emplace_back([this, slotNumber, addSize, is_sync, sync_all, sync_star]() {
+	struct SyncActiveGuard {
+	  bool armed = false;
+	  ~SyncActiveGuard() {
+	    if (armed) g_sync_active.fetch_sub(1, std::memory_order_relaxed);
+	  }
+	} sync_active_guard;
+	if (is_sync) {
+	  g_sync_active.fetch_add(1, std::memory_order_relaxed);
+	  sync_active_guard.armed = true;
+	}
 	SDK::CrDeviceHandle handle = this->device_handle;
 	if (!handle) return;
 	SDK::CrSlotNumber slot = (slotNumber == SDK::CrSlotNumber_Slot2) ? SDK::CrSlotNumber_Slot2 : SDK::CrSlotNumber_Slot1;
@@ -3033,14 +3047,23 @@ public:
 	    return; // bail out before planning/logging
 	  }
 	  
-	  if (verbose) LOGI("[SYNC] slot " << (int)slot << ": planning " << count << " item(s)"
-	       << (sync_all ? " (all days)" : ""));
-	  
-	  // For "sync all", we want everything; otherwise keep your newest-first N logic
-	  CrInt32u want = (sync_all ? count : (want_hint > 0 ? want_hint : 1));
+	  std::vector<CrInt32u> idx;
+	  idx.reserve(count);
+	  for (CrInt32u i = 0; i < count; ++i) {
+	    if (sync_star) {
+	      int rating_value = contents_rating_to_int(list[i].rating);
+	      if (rating_value < 1) continue;
+	      if (!contents_info_has_still_image(list[i])) continue;
+	    }
+	    idx.push_back(i);
+	  }
 
-	  std::vector<CrInt32u> idx(count);
-	  for (CrInt32u i = 0; i < count; ++i) idx[i] = i;
+	  if (verbose) LOGI("[SYNC] slot " << (int)slot << ": planning " << idx.size() << " matched item(s)"
+	       << (sync_star ? " (starred stills)" : (sync_all ? " (all contents)" : "")));
+	  
+	  // For full-library sync modes, we want everything; otherwise keep newest-first N logic.
+	  CrInt32u want = ((sync_all || sync_star) ? static_cast<CrInt32u>(idx.size())
+	                                           : (want_hint > 0 ? want_hint : 1));
 
 	  if (!sync_all) {
 	    std::sort(idx.begin(), idx.end(), [&](CrInt32u a, CrInt32u b) {
@@ -3073,6 +3096,7 @@ public:
 	    if (target.contentId == 0) continue;
 
 	    for (CrInt32u fi = 0; fi < target.filesNum; ++fi) {
+	      if (sync_star && !target.files[fi].isImageParamExsist) continue;
 
 	      if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
 		dl_waiting = false;             // nothing in-flight yet for this file
@@ -3130,6 +3154,12 @@ public:
       SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(
 								 handle, slot, target.contentId, fileId, 0x1000000,
 								 saveDir, const_cast<CrChar *>(finalName.c_str()));
+	      if (dres != SDK::CrError_None) {
+		dl_waiting = false;
+		LOGE("GetRemoteTransferContentsDataFile failed: "
+		     << crsdk_err::error_to_name(dres) << " (0x" << std::hex << dres << std::dec << ")");
+		continue;
+	      }
 
 	      {
 		std::unique_lock<std::mutex> lk(dl_mtx);
@@ -3147,84 +3177,26 @@ public:
 	};
 
 	// -------- fetch & process --------
-	SDK::CrError resList = SDK::CrError_None;
-
-	if (sync_all) {
-	  // Walk ALL dates
-	  SDK::CrCaptureDate *dateList = nullptr; CrInt32u dateNums = 0;
-	  resList = SDK::GetRemoteTransferCapturedDateList(handle, slot, &dateList, &dateNums);
-	  if (resList != SDK::CrError_None || !dateList || dateNums == 0) {
-	    if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    if (verbose) LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
-	    return;
+	SDK::CrCaptureDate dummy_day{};
+	SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0;
+	SDK::CrError resList = SDK::GetRemoteTransferContentsInfoList(handle, slot,
+							     SDK::CrGetContentsInfoListType_All,
+							     &dummy_day, 0, &list, &count);
+	if (resList != SDK::CrError_None || !list || count == 0) {
+	  if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
+	  if (verbose) {
+	    LOGI("[INFO] No " << (sync_star ? "starred " : "")
+		 << "contents found (slot=" << (int)slot << ")");
 	  }
-
-	  // Process each date (newest-first is fine but not required when syncing *all*)
-	  auto newer = [](const SDK::CrCaptureDate& A, const SDK::CrCaptureDate& B){
-	    if (A.year != B.year) return A.year > B.year;
-	    if (A.month != B.month) return A.month > B.month;
-	    return A.day > B.day;
-	  };
-	  std::vector<SDK::CrCaptureDate> days(dateList, dateList + dateNums);
-	  std::sort(days.begin(), days.end(), newer);
-
-	  if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
-	    LOGI("Sync: stopped (slot " << (int)slot << ").");
-	    SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    return;
-	  }
-	  
-	  for (auto const& day : days) {
-
-	    if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
-	      LOGI("Sync: stopped (slot " << (int)slot << ").");
-	      break;
-	    }
-	    
-	    if (g_stop.load(std::memory_order_relaxed)) break;
-	    SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0;
-	    resList = SDK::GetRemoteTransferContentsInfoList(handle, slot,
-							     SDK::CrGetContentsInfoListType_Range_Day, const_cast<SDK::CrCaptureDate*>(&day),
-							     0, &list, &count);
-	    if (resList == SDK::CrError_None && list && count > 0) {
-	      process_list(list, count, /*want_hint*/0);
-	    }
-	    if (list) SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
-	  }
-	  SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	} else {
-	  // EXISTING behavior: newest day & newest N items
-	  SDK::CrCaptureDate *dateList = nullptr; CrInt32u dateNums = 0;
-	  SDK::CrError derr = SDK::GetRemoteTransferCapturedDateList(handle, slot, &dateList, &dateNums);
-	  if (derr == SDK::CrError_None && dateList && dateNums > 0) {
-	    // pick latest by Y/M/D
-	    SDK::CrCaptureDate latest = dateList[0];
-	    for (CrInt32u i = 1; i < dateNums; ++i) {
-	      const auto &D = dateList[i];
-	      if ((D.year > latest.year) ||
-		  (D.year == latest.year && D.month > latest.month) ||
-		  (D.year == latest.year && D.month == latest.month && D.day > latest.day)) {
-		latest = D;
-	      }
-	    }
-	    SDK::CrContentsInfo *list = nullptr; CrInt32u count = 0;
-	    resList = SDK::GetRemoteTransferContentsInfoList(handle, slot,
-							     SDK::CrGetContentsInfoListType_Range_Day, &latest, 0, &list, &count);
-	    SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    if (resList != SDK::CrError_None || !list || count == 0) {
-	      if (list) { SDK::ReleaseRemoteTransferContentsInfoList(handle, list); }
-	      if (verbose) LOGI("[INFO] No contents found for latest day (slot=" << (int)slot << ")");
-	      return;
-	    }
-
-	    process_list(list, count, /*want_hint*/(addSize > 0 ? addSize : 1));
-	    SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
-	  } else {
-	    if (dateList) SDK::ReleaseRemoteTransferCapturedDateList(handle, dateList);
-	    if (verbose) LOGI("[INFO] No contents found (slot=" << (int)slot << ")");
-	    return;
-	  }
+	  return;
 	}
+
+	if (verbose) LOGI("[SYNC] slot " << (int)slot << ": processing contents list...");
+	process_list(list, count, sync_all ? 0 : (addSize > 0 ? addSize : 1));
+	if (verbose) LOGI("[SYNC] slot " << (int)slot << ": releasing contents list...");
+	SDK::ReleaseRemoteTransferContentsInfoList(handle, list);
+	if (verbose) LOGI("[SYNC] slot " << (int)slot << ": contents list released.");
+	if (verbose) LOGI("[SYNC] slot " << (int)slot << ": worker complete.");
       });
     } catch (...) {
       LOGE("[ERROR] Failed to create download thread");
@@ -4273,9 +4245,10 @@ int main(int argc, char **argv) {
 	  return 0;
 	}},
 	{"sync", [&](auto const& args)->int {
-	  // usage: sync [N | all | stop]  (default = 1)
+	  // usage: sync [N | all | star | stop]  (default = 1)
 	  int n = 1;
 	  bool all = false;
+	  bool star = false;
 	  if (args.size() >= 2) {
 	    std::string a = args[1];
 	    std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c){ return std::tolower(c); });
@@ -4292,6 +4265,9 @@ int main(int argc, char **argv) {
 	    }
 	    else if (a == "all") {
 	      all = true;
+	    }
+	    else if (a == "star") {
+	      star = true;
 	    }
 	    else if (a == "stop") {
 	      if (!g_sync_running.load(std::memory_order_acquire)) {
@@ -4340,7 +4316,7 @@ int main(int argc, char **argv) {
 	    }
 	    else {
 	      try { n = std::max(1, std::stoi(args[1])); }
-	      catch (...) { LOGE("usage: sync [count|all]"); return 2; }
+	      catch (...) { LOGE("usage: sync [count|all|star|on|off|stop]"); return 2; }
 	    }
 	  }
 
@@ -4355,57 +4331,90 @@ int main(int argc, char **argv) {
 	    return 0;
 	  }
 
-	  if (all) LOGI("Sync: ALL items from both slots (skip existing, keep names)...");
-	  else     LOGI("Sync: latest " << n << " item(s) per slot (skip existing, keep names)...");
+	  if (star) LOGI("Sync: starred still images from both slots (rating >= 1; skip existing, keep names)...");
+	  else if (all) LOGI("Sync: ALL items from both slots (skip existing, keep names)...");
+	  else          LOGI("Sync: latest " << n << " item(s) per slot (skip existing, keep names)...");
 
 	  g_sync_abort.store(false, std::memory_order_release);
 
 	  // Fire-and-forget worker so REPL stays responsive
 	  try {
-	    std::thread([&, all, n]{
+	    std::thread([&, all, star, n]{
 	      struct SyncRunningReset {
 		~SyncRunningReset() { g_sync_running.store(false, std::memory_order_release); }
 	      } _sync_reset_guard;
+	      auto sync_started_at = std::chrono::steady_clock::now();
+	      auto next_progress_log_at = sync_started_at + std::chrono::seconds(5);
 
 	    if (all) g_sync_all.store(true, std::memory_order_relaxed);
+	    if (star) g_sync_star.store(true, std::memory_order_relaxed);
+	    auto wait_for_sync_workers = [&]() {
+	      for (int i = 0; i < 40; ++i) { // ~1s total
+		if (g_sync_active.load(std::memory_order_relaxed) > 0 ||
+		    g_sync_abort.load(std::memory_order_acquire) ||
+		    g_stop.load(std::memory_order_relaxed)) {
+		  break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	      }
 
-	    // Arm tokens for exactly two callback invocations (slot1 + slot2)
-	    g_sync_tokens.store(2, std::memory_order_relaxed);
+	      while (!g_stop.load(std::memory_order_relaxed) &&
+		     g_sync_active.load(std::memory_order_relaxed) > 0) {
+		auto now = std::chrono::steady_clock::now();
+		if (now >= next_progress_log_at) {
+		  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - sync_started_at).count();
+		  LOGI("Sync: still running (" << elapsed << "s elapsed, workers="
+		       << g_sync_active.load(std::memory_order_relaxed) << ").");
+		  next_progress_log_at = now + std::chrono::seconds(5);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	      }
+	    };
 
-	    // Reset active counter before we spawn the workers
+	    // Reset active counter before we spawn any workers.
 	    g_sync_active.store(0, std::memory_order_relaxed);
 
-	    // Kick both slots; same path as before
-	    cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
-							 SDK::CrSlotNumber_Slot1, all ? 0 : n);
-	    cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
-							 SDK::CrSlotNumber_Slot2, all ? 0 : n);
+	    if (all || star) {
+	      auto run_slot_sync = [&](SDK::CrSlotNumber slot_number) {
+		if (g_sync_abort.load(std::memory_order_acquire) ||
+		    g_stop.load(std::memory_order_relaxed)) {
+		  return;
+		}
+		g_sync_tokens.store(1, std::memory_order_relaxed);
+		cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
+							     slot_number, 0);
+		wait_for_sync_workers();
+	      };
 
-	    // wait briefly until at least one worker has started (or an abort/stop)
-	    for (int i = 0; i < 40; ++i) { // ~1s total
-	      if (g_sync_active.load(std::memory_order_relaxed) > 0 ||
-	  	g_sync_abort.load(std::memory_order_acquire) ||
-		  g_stop.load(std::memory_order_relaxed)) {
-		break;
-	      }
-	      std::this_thread::sleep_for(std::chrono::milliseconds(25));
-	    }
-	    
-	    // Background wait (so prompt remains free)
-	    while (!g_stop.load(std::memory_order_relaxed) &&
-		   g_sync_active.load(std::memory_order_relaxed) > 0) {
-	      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	      run_slot_sync(SDK::CrSlotNumber_Slot1);
+	      run_slot_sync(SDK::CrSlotNumber_Slot2);
+	    } else {
+	      // Arm tokens for exactly two callback invocations (slot1 + slot2).
+	      g_sync_tokens.store(2, std::memory_order_relaxed);
+
+	      cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
+							   SDK::CrSlotNumber_Slot1, n);
+	      cb.OnNotifyRemoteTransferContentsListChanged(SDK::CrNotify_RemoteTransfer_Changed_Add,
+							   SDK::CrSlotNumber_Slot2, n);
+	      wait_for_sync_workers();
 	    }
 
-	    // Reset flag so future "sync N" behaves normally
+	    // Reset flags so future sync commands behave normally
 	    g_sync_all.store(false, std::memory_order_relaxed);
+	    g_sync_star.store(false, std::memory_order_relaxed);
+
+	    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+	        std::chrono::steady_clock::now() - sync_started_at).count();
+	    bool aborted = g_sync_abort.load(std::memory_order_acquire);
 
 	    // at the end of the detached sync thread
-	    if (g_sync_abort.load(std::memory_order_acquire)) {
+	    if (aborted) {
 	      LOGI("Sync: stopped.");
 	    } else {
 	      LOGI("Sync: done.");
 	    }
+	    LOGI("Sync session ended after " << elapsed << "s"
+		 << " (" << (aborted ? "stopped" : "completed") << ").");
 	    
 	  }).detach();
 	  } catch (...) {
