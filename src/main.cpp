@@ -80,6 +80,15 @@ static std::atomic<bool> g_sync_star{false};
 static std::atomic<bool> g_sync_abort{false};
 static std::atomic<bool> g_sync_running{false};
 static std::atomic<bool> g_auto_sync_enabled{false};
+struct SyncTransferStatus {
+  std::string label;
+  CrInt32u progress = 0;
+  SDK::CrSlotNumber slot = SDK::CrSlotNumber_Slot1;
+  std::chrono::steady_clock::time_point started_at{};
+};
+static std::mutex g_sync_transfer_mtx;
+static std::unordered_map<std::uint64_t, SyncTransferStatus> g_sync_transfers;
+static std::atomic<std::uint64_t> g_next_sync_transfer_id{1};
 static std::vector<std::vector<std::string>> g_init_commands;
 static std::atomic<bool> g_init_commands_ran{false};
 static std::atomic<bool> g_sigint_requested{false};
@@ -109,6 +118,77 @@ static std::mutex g_command_runner_mutex;
 static std::condition_variable g_command_runner_cv;
 static std::function<int(const std::vector<std::string>&)> g_command_runner;
 static std::mutex g_command_exec_mutex;
+
+static std::uint64_t register_sync_transfer(const std::string &label,
+                                            SDK::CrSlotNumber slot) {
+  std::uint64_t id = g_next_sync_transfer_id.fetch_add(1, std::memory_order_relaxed);
+  SyncTransferStatus status;
+  status.label = label;
+  status.slot = slot;
+  status.started_at = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lk(g_sync_transfer_mtx);
+  g_sync_transfers[id] = status;
+  return id;
+}
+
+static void update_matching_sync_transfer(const std::string &label,
+                                          CrInt32u progress) {
+  std::lock_guard<std::mutex> lk(g_sync_transfer_mtx);
+  if (g_sync_transfers.empty()) return;
+
+  auto apply = [&](SyncTransferStatus &status) {
+    if (!label.empty()) status.label = label;
+    status.progress = std::min<CrInt32u>(progress, 100);
+  };
+
+  if (!label.empty()) {
+    for (auto &entry : g_sync_transfers) {
+      if (entry.second.label == label) {
+        apply(entry.second);
+        return;
+      }
+    }
+  }
+
+  if (g_sync_transfers.size() == 1) {
+    apply(g_sync_transfers.begin()->second);
+  }
+}
+
+static void unregister_sync_transfer(std::uint64_t id) {
+  std::lock_guard<std::mutex> lk(g_sync_transfer_mtx);
+  g_sync_transfers.erase(id);
+}
+
+static std::string sync_transfer_status_summary() {
+  std::vector<SyncTransferStatus> active;
+  {
+    std::lock_guard<std::mutex> lk(g_sync_transfer_mtx);
+    active.reserve(g_sync_transfers.size());
+    for (const auto &entry : g_sync_transfers) {
+      active.push_back(entry.second);
+    }
+  }
+
+  if (active.empty()) return {};
+  std::sort(active.begin(), active.end(),
+            [](const SyncTransferStatus &a, const SyncTransferStatus &b) {
+              return a.started_at < b.started_at;
+            });
+
+  std::ostringstream out;
+  out << " files=[";
+  for (std::size_t i = 0; i < active.size(); ++i) {
+    if (i > 0) out << ", ";
+    std::string label = active[i].label.empty() ? "(unknown file)" : active[i].label;
+    std::size_t pos = label.find_last_of("/\\");
+    if (pos != std::string::npos) label = label.substr(pos + 1);
+    out << "slot " << static_cast<int>(active[i].slot) << ": "
+        << label << ' ' << active[i].progress << '%';
+  }
+  out << ']';
+  return out.str();
+}
 
 static const char* camera_power_status_to_string(SDK::CrCameraPowerStatus status) {
   switch (status) {
@@ -3196,6 +3276,10 @@ public:
       dl_any_progress = false;
       dl_current_operation = is_sync ? "sync" : "new";
       dl_current_mode = capture_mode_string(device_handle, target, target.files[fi]);
+      std::uint64_t sync_transfer_id = 0;
+      if (is_sync) {
+        sync_transfer_id = register_sync_transfer(dl_current_label, slot);
+      }
 
       // kick off download
       SDK::CrError dres = SDK::GetRemoteTransferContentsDataFile(
@@ -3203,6 +3287,7 @@ public:
 								 saveDir, const_cast<CrChar *>(finalName.c_str()));
 	      if (dres != SDK::CrError_None) {
 		dl_waiting = false;
+		if (sync_transfer_id != 0) unregister_sync_transfer(sync_transfer_id);
 		LOGE("GetRemoteTransferContentsDataFile failed: "
 		     << crsdk_err::error_to_name(dres) << " (0x" << std::hex << dres << std::dec << ")");
 		continue;
@@ -3212,11 +3297,13 @@ public:
 		std::unique_lock<std::mutex> lk(dl_mtx);
 		dl_cv.wait(lk, [&] { return !dl_waiting || g_stop.load(); });
 
+	      }
+	      if (sync_transfer_id != 0) unregister_sync_transfer(sync_transfer_id);
+
 	if (is_sync && g_sync_abort.load(std::memory_order_acquire)) {
 	  // We just finished a file; exit early.
 	  break;
 	}
-	      }
 
 	      if (g_stop.load(std::memory_order_relaxed)) break;
 	    }
@@ -3283,6 +3370,7 @@ public:
         // Suppress noise while waiting for the device to acknowledge cancellation.
         return;
       }
+      update_matching_sync_transfer(label, per);
       // Throttle: log when +5% or +1s since last log (and always at 0%)
       auto now = std::chrono::steady_clock::now();
       bool time_ok = (dl_last_log_tp.time_since_epoch().count() == 0) ||
@@ -3300,6 +3388,9 @@ public:
     }
 
     // Non-progress notifications: finish/abort/etc.
+    if (notify == SDK::CrNotify_RemoteTransfer_Result_OK) {
+      update_matching_sync_transfer(label, 100);
+    }
     dl_waiting = false;
     dl_cv.notify_all();
 
@@ -4420,7 +4511,8 @@ int main(int argc, char **argv) {
 		if (now >= next_progress_log_at) {
 		  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - sync_started_at).count();
 		  LOGI("Sync: still running (" << elapsed << "s elapsed, workers="
-		       << g_sync_active.load(std::memory_order_relaxed) << ").");
+		       << g_sync_active.load(std::memory_order_relaxed) << ")."
+		       << sync_transfer_status_summary());
 		  next_progress_log_at = now + std::chrono::seconds(5);
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -4429,6 +4521,10 @@ int main(int argc, char **argv) {
 
 	    // Reset active counter before we spawn any workers.
 	    g_sync_active.store(0, std::memory_order_relaxed);
+	    {
+	      std::lock_guard<std::mutex> lk(g_sync_transfer_mtx);
+	      g_sync_transfers.clear();
+	    }
 
 	    if (all || star) {
 	      auto run_slot_sync = [&](SDK::CrSlotNumber slot_number) {
@@ -4458,6 +4554,10 @@ int main(int argc, char **argv) {
 	    // Reset flags so future sync commands behave normally
 	    g_sync_all.store(false, std::memory_order_relaxed);
 	    g_sync_star.store(false, std::memory_order_relaxed);
+	    {
+	      std::lock_guard<std::mutex> lk(g_sync_transfer_mtx);
+	      g_sync_transfers.clear();
+	    }
 
 	    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
 	        std::chrono::steady_clock::now() - sync_started_at).count();
